@@ -1,11 +1,16 @@
 const express = require('express');
-const cors = require('cors');
-const { OpenAI } = require('openai');
-const { spawn } = require('child_process');
-const path = require('path');
 const session = require('express-session');
+const cors = require('cors');
 const { OAuth2Client } = require('google-auth-library');
+const { OpenAI } = require('openai');
+const multer = require('multer');
+const { spawn } = require('child_process');
 const fs = require('fs').promises;
+const path = require('path');
+const { v4: uuidv4 } = require('uuid');
+require('dotenv').config();
+
+
 const upload = require('./middleware/upload');
 const User = require('./models/User');
 const Chat = require('./models/Chat');
@@ -14,7 +19,7 @@ const Attachment = require('./models/Attachment');
 const AuthToken = require('./models/AuthToken');
 const FileUploadService = require('./services/fileUpload');
 const FileParser = require('./services/fileParser');
-require('dotenv').config();
+const SupabaseSessionStore = require('./middleware/sessionStore');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -23,23 +28,62 @@ const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET;
 const GOOGLE_REDIRECT_URI = process.env.GOOGLE_REDIRECT_URI || 'http://localhost:3000/auth/google/callback';
 
 const googleClient = new OAuth2Client(GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REDIRECT_URI);
+const sessionStore = new SupabaseSessionStore();
+sessionStore.startCleanup();
+// CORS configuration - CRITICAL FIX
+const corsOptions = {
+    origin: function (origin, callback) {
+        const allowedOrigins = [
+            'http://localhost:5173',
+            'http://localhost:3000',
+            'http://127.0.0.1:5173',
+            process.env.FRONTEND_URL
+        ].filter(Boolean);
+
+        console.log('🔍 CORS check - Origin:', origin, 'Allowed:', allowedOrigins);
+
+        if (!origin || allowedOrigins.includes(origin)) {
+            callback(null, true);
+        } else {
+            console.log('❌ CORS blocked origin:', origin);
+            callback(new Error('Not allowed by CORS'));
+        }
+    },
+    credentials: true,
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'Cookie'],
+    exposedHeaders: ['Set-Cookie']
+};
 
 // Middleware
-app.use(cors({
-    origin: 'http://localhost:5173',
-    credentials: true
-}));
+app.use(cors(corsOptions));
 app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ extended: true, limit: '50mb' }));
+
+// Session configuration - CRITICAL FIX
 app.use(session({
-    secret: process.env.SESSION_SECRET || 'your-secret-key-here',
+    store: sessionStore,
+    secret: process.env.SESSION_SECRET || 'your-secret-key',
     resave: false,
     saveUninitialized: false,
+    rolling: true,
     cookie: {
         secure: process.env.NODE_ENV === 'production',
         httpOnly: true,
-        maxAge: 24 * 60 * 60 * 1000 // 24 hours
-    }
+        maxAge: 24 * 60 * 60 * 1000, // 24 hours
+        sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax'
+    },
+    name: 'sessionId'
 }));
+
+// Add session debugging middleware
+app.use((req, res, next) => {
+    console.log(`${new Date().toISOString()} - ${req.method} ${req.path}`);
+    console.log('Session ID:', req.sessionID);
+    console.log('Session data:', req.session);
+    console.log('Cookies:', req.headers.cookie);
+    next();
+});
 
 // OpenAI client
 const openai = new OpenAI({
@@ -52,6 +96,7 @@ let mcpReady = false;
 let requestId = 1;
 let availableTools = [];
 let pendingResponses = new Map();
+let currentUserId = null;
 
 // Complete list of ALL MCP tools (30+ tools)
 const getAllMCPTools = () => [
@@ -104,17 +149,20 @@ const getAllMCPTools = () => [
     {
         type: "function",
         function: {
-            name: "drive_create_file",
-            description: "Create a new file in Google Drive",
+            // FIX: Renamed to match the Python tool name
+            name: "drive_create",
+            description: "Create a new file in Google Drive. Handles Google Docs, PDFs, and plain text.",
             parameters: {
                 type: "object",
                 properties: {
-                    name: { type: "string", description: "Name of the file to create" },
-                    content: { type: "string", description: "Content of the file" },
-                    mime_type: { type: "string", description: "MIME type of the file" },
-                    folder_id: { type: "string", description: "Parent folder ID (optional)" }
+                    name: { type: "string", description: "Name of the file (e.g., 'My Document')" },
+                    // FIX: Changed mime_type to mimeType to match the Python tool's argument
+                    mimeType: { type: "string", description: "MIME type (e.g., 'application/vnd.google-apps.document', 'text/plain', 'application/pdf')" },
+                    content: { type: "string", description: "The text content for the file." },
+                    folder_id: { type: "string", description: "Optional parent folder ID to create the file in." }
                 },
-                required: ["name", "content"]
+                // FIX: Added mimeType to the required parameters
+                required: ["name", "mimeType", "content"]
             }
         }
     },
@@ -196,7 +244,7 @@ const getAllMCPTools = () => [
             }
         }
     },
-  
+
 
     // Gmail Tools (8 tools)
     {
@@ -642,13 +690,41 @@ const getAllMCPTools = () => [
 ];
 
 // Initialize MCP Server
-function initializeMCP() {
+async function initializeMCP(userId) {
+    if (!userId) {
+        console.error('❌ Cannot start MCP without userId');
+        return;
+    }
+    currentUserId = userId;
+
     const mcpPath = path.join(__dirname, 'mcp_toolkit.py');
+
+    let tokenData;
+    try {
+        tokenData = await AuthToken.findByUserId(userId);
+        if (!tokenData) throw new Error('No auth token found for user');
+    } catch (err) {
+        console.error('❌ Failed to load token from Supabase:', err.message);
+        return;
+    }
+
+    const mcpEnv = {
+        ...process.env,
+        PYTHONUNBUFFERED: '1',
+        GOOGLE_ACCESS_TOKEN: tokenData.access_token,
+        GOOGLE_REFRESH_TOKEN: tokenData.refresh_token,
+        GOOGLE_TOKEN_EXPIRES_AT: new Date(tokenData.expires_at).getTime().toString(),
+        SESSION_USER_ID: userId
+    };
+    console.log('🔐 Starting MCP with tokens:', {
+        access: tokenData.access_token?.substring(0, 5) + '...',
+        refresh: tokenData.refresh_token?.substring(0, 5) + '...',
+        expires: tokenData.expires_at
+    });
     mcpProcess = spawn('python', [mcpPath], {
         stdio: ['pipe', 'pipe', 'pipe'],
-        env: { ...process.env, PYTHONUNBUFFERED: '1' }
+        env: mcpEnv
     });
-
     let outputBuffer = '';
 
     mcpProcess.stdout.on('data', (data) => {
@@ -687,25 +763,16 @@ function initializeMCP() {
             }
         }
     });
-
     mcpProcess.stderr.on('data', (data) => {
-        const error = data.toString();
-        if (!error.includes('file_cache') && !error.includes('oauth2client') && !error.includes('WARNING')) {
-            console.error('❌ MCP Error:', error);
-        }
+        // This will print any and all messages from Python's stderr stream
+        console.error(`[PYTHON STDERR]: ${data.toString()}`);
     });
+    // --- END OF ADDED BLOCK ---
 
+    // It's also good practice to know if the process closes unexpectedly
     mcpProcess.on('close', (code) => {
-        console.log(`🔄 MCP process exited with code ${code}`);
-        mcpReady = false;
-        setTimeout(() => {
-            console.log('🔄 Attempting to restart MCP server...');
-            initializeMCP();
-        }, 5000);
-    });
-
-    mcpProcess.on('error', (error) => {
-        console.error('❌ MCP Process Error:', error);
+        console.log(`MCP process exited with code ${code}`);
+        mcpProcess = null; // Clear the process variable
         mcpReady = false;
     });
 
@@ -713,17 +780,6 @@ function initializeMCP() {
         initializeMCPHandshake();
     }, 2000);
 }
-
-function restartMCP() {
-    console.log('♻️ Restarting MCP due to updated credentials...');
-    if (mcpProcess) {
-        mcpProcess.kill();
-    }
-    setTimeout(() => {
-        initializeMCP();
-    }, 1000);
-}
-
 async function initializeMCPHandshake() {
     try {
         console.log('🤝 Starting MCP handshake...');
@@ -749,6 +805,9 @@ async function initializeMCPHandshake() {
 
     } catch (error) {
         console.error('❌ MCP Handshake failed:', error);
+        setTimeout(() => {
+            initializeMCPHandshake();
+        }, 5000);
     }
 }
 
@@ -846,11 +905,6 @@ async function callMCPTool(toolName, params) {
     try {
         console.log(`🔧 Calling MCP tool: ${toolName}`, params);
 
-        if (!mcpReady) {
-            // Provide demo responses when MCP is not ready
-            return getDemoToolResponse(toolName, params);
-        }
-
         const result = await sendMCPRequest('tools/call', {
             name: toolName,
             arguments: params
@@ -873,8 +927,8 @@ async function callMCPTool(toolName, params) {
         }
     } catch (error) {
         console.error(`❌ Error calling tool ${toolName}:`, error);
-        // Fallback to demo response on error
-        return getDemoToolResponse(toolName, params);
+
+        return `Error: The tool '${toolName}' failed to execute. Reason: ${error.message}`;
     }
 }
 
@@ -884,9 +938,9 @@ function getDemoToolResponse(toolName, params) {
         'drive_search': `Demo: Found 3 files matching "${params.query}": Document1.docx, Spreadsheet1.xlsx, Presentation1.pptx`,
         'drive_list_files': 'Demo: Listed 10 files from Google Drive: file1.pdf, file2.docx, file3.xlsx...',
         'drive_read_file': `Demo: Reading file content for ${params.file_id}. Content: "This is sample file content..."`,
-        'drive_create_file': `Demo: Created file "${params.name}" successfully. File ID: demo_file_123`,
+        'drive_create': `Demo: Created file "${params.name}" successfully. File ID: demo_file_123`,
         'drive_update_file': `Demo: Updated file ${params.file_id} with new content`,
-        'drive_delete_file': `Demo: Deleted file ${params.file_id} successfully`,
+        'drive_delete': `Demo: Deleted file ${params.file_id} successfully`,
         'drive_share_file': `Demo: Shared file ${params.file_id} with ${params.email} as ${params.role}`,
         'drive_upload_file': `Demo: Uploaded file from ${params.file_path} to Google Drive`,
         'drive_create_folder': `Demo: Created folder "${params.name}" successfully`,
@@ -935,15 +989,44 @@ function getDemoToolResponse(toolName, params) {
 }
 
 // Authentication middleware
-const requireAuth = (req, res, next) => {
-    if (!req.session.user) {
-        return res.status(401).json({ error: 'Authentication required' });
+const requireAuth = async (req, res, next) => {
+    try {
+        console.log('🔐 Auth middleware - Session:', req.session);
+
+        if (!req.session || !req.session.userId) {
+            console.log('❌ No session or userId found');
+            return res.status(401).json({
+                authenticated: false,
+                error: 'Not authenticated'
+            });
+        }
+
+        // Get user from database
+        const user = await User.findById(req.session.userId);
+        if (!user) {
+            console.log('❌ User not found in database');
+            req.session.destroy();
+            return res.status(401).json({
+                authenticated: false,
+                error: 'User not found'
+            });
+        }
+
+        req.user = user;
+        console.log('✅ User authenticated:', user.email);
+        next();
+    } catch (error) {
+        console.error('❌ Auth middleware error:', error);
+        res.status(500).json({
+            authenticated: false,
+            error: 'Authentication error'
+        });
     }
-    next();
 };
 
 // Google OAuth routes
 app.get('/auth/google', (req, res) => {
+    console.log('🔍 Starting Google OAuth flow...');
     const authUrl = googleClient.generateAuthUrl({
         access_type: 'offline',
         scope: [
@@ -961,34 +1044,47 @@ app.get('/auth/google', (req, res) => {
         ],
         prompt: 'consent'
     });
+    console.log('🔗 Redirecting to Google OAuth URL');
     res.redirect(authUrl);
 });
-
 app.get('/auth/google/callback', async (req, res) => {
     try {
-        const { code } = req.query;
+        console.log('📥 Google OAuth callback received');
+        console.log('Query params:', req.query);
 
-        if (!code) {
-            console.error('No authorization code received');
-            return res.redirect('http://localhost:5173/login?error=no_code');
+        const { code, error } = req.query;
+
+        if (error) {
+            console.error('❌ OAuth error:', error);
+            const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:5173';
+            return res.redirect(`${frontendUrl}/login?error=${encodeURIComponent(error)}`);
         }
 
-        console.log('🔐 Processing Google OAuth callback...');
+        if (!code) {
+            console.error('❌ No authorization code received');
+            const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:5173';
+            return res.redirect(`${frontendUrl}/login?error=no_code`);
+        }
 
+        // Exchange code for tokens
+        console.log('🔄 Exchanging code for tokens...');
         const { tokens } = await googleClient.getToken(code);
-        console.log('✅ Received OAuth tokens');
+        console.log('✅ Tokens received');
 
         // Get user info
         googleClient.setCredentials(tokens);
         const ticket = await googleClient.verifyIdToken({
             idToken: tokens.id_token,
-            audience: GOOGLE_CLIENT_ID
+            audience: process.env.GOOGLE_CLIENT_ID,
         });
 
         const payload = ticket.getPayload();
         const googleId = payload.sub;
-
-        console.log('👤 User info retrieved:', { email: payload.email, name: payload.name });
+        console.log('👤 User info:', {
+            id: payload.sub,
+            email: payload.email,
+            name: payload.name
+        });
 
         // Find or create user in database
         let user = await User.findByGoogleId(googleId);
@@ -1001,6 +1097,7 @@ app.get('/auth/google/callback', async (req, res) => {
                 name: payload.name,
                 picture: payload.picture
             });
+            console.log('✅ User created:', user.id);
         } else {
             console.log('👋 Existing user found, updating info...');
             user = await User.update(user.id, {
@@ -1017,7 +1114,7 @@ app.get('/auth/google/callback', async (req, res) => {
         if (existingToken) {
             await AuthToken.update(user.id, {
                 access_token: tokens.access_token,
-                refresh_token: tokens.refresh_token,
+                refresh_token: tokens.refresh_token || existingToken.refresh_token,
                 id_token: tokens.id_token,
                 expires_at: expiresAt
             });
@@ -1031,7 +1128,9 @@ app.get('/auth/google/callback', async (req, res) => {
             });
         }
 
-        // Store user session
+
+        // CRITICAL: Store user session BEFORE redirect
+        req.session.userId = user.id;
         req.session.user = {
             id: user.id,
             email: user.email,
@@ -1042,26 +1141,55 @@ app.get('/auth/google/callback', async (req, res) => {
         // Store tokens in session for immediate use
         req.session.tokens = tokens;
 
-        console.log('💾 User session created successfully');
+        console.log('💾 User session created successfully:', {
+            userId: user.id,
+            email: user.email,
+            sessionID: req.sessionID
+        });
 
-        // Save OAuth tokens for MCP toolkit
-        await fs.writeFile(path.join(__dirname, 'token.json'), JSON.stringify(tokens, null, 2));
-        restartMCP();
+        // Save session explicitly before redirect
+        req.session.save((err) => {
+            if (err) {
+                console.error('❌ Session save error:', err);
+                return res.redirect(`${process.env.FRONTEND_URL}/login?error=session_error`);
+            }
 
-        console.log('🔄 Redirecting to chat interface...');
-        res.redirect('http://localhost:5173/chat');
+            console.log('✅ Session saved successfully');
+
+            // Initialize MCP after session is saved
+            try {
+                initializeMCP(user.id);
+                console.log("✅ MCP initialization started");
+            } catch (error) {
+                console.error("❌ MCP initialization error:", error);
+            }
+
+            console.log('🔄 Redirecting to chat interface...');
+            const encodedUser = encodeURIComponent(JSON.stringify(req.session.user));
+            res.redirect(`${process.env.FRONTEND_URL}/chat?success=true&user=${encodedUser}`);
+        });
 
     } catch (error) {
         console.error('❌ Google OAuth callback error:', error);
-        res.redirect('http://localhost:5173/login?error=auth_failed');
+        res.redirect(`${process.env.FRONTEND_URL}/login?error=auth_failed`);
     }
 });
 
 app.get('/auth/user', async (req, res) => {
     try {
+        console.log('🔍 Auth check request:', {
+            hasSession: !!req.session,
+            hasUser: !!req.session.user,
+            userEmail: req.session.user?.email,
+            sessionID: req.sessionID,
+            cookies: req.headers.cookie ? 'present' : 'missing'
+        });
+
         if (req.session.user) {
             // Get user preferences
             const preferences = await User.getPreferences(req.session.user.id);
+
+            console.log('✅ User authenticated:', req.session.user.email);
 
             res.json({
                 authenticated: true,
@@ -1075,13 +1203,14 @@ app.get('/auth/user', async (req, res) => {
                 }
             });
         } else {
+            console.log('❌ User not authenticated - no session user');
             res.json({
                 authenticated: false,
                 user: null
             });
         }
     } catch (error) {
-        console.error('Error checking auth:', error);
+        console.error('❌ Error checking auth:', error);
         res.json({
             authenticated: false,
             user: null
@@ -1091,6 +1220,8 @@ app.get('/auth/user', async (req, res) => {
 
 app.post('/auth/logout', async (req, res) => {
     try {
+        console.log('👋 User logging out:', req.session.user?.email);
+
         if (req.session.user) {
             // Optionally clean up tokens from database
             await AuthToken.delete(req.session.user.id);
@@ -1098,13 +1229,16 @@ app.post('/auth/logout', async (req, res) => {
 
         req.session.destroy((err) => {
             if (err) {
-                console.error('Session destruction error:', err);
+                console.error('❌ Session destruction error:', err);
                 return res.status(500).json({ error: 'Failed to logout' });
             }
+
+            res.clearCookie('sessionId');
+            console.log('✅ User logged out successfully');
             res.json({ success: true });
         });
     } catch (error) {
-        console.error('Logout error:', error);
+        console.error('❌ Logout error:', error);
         res.status(500).json({ error: 'Failed to logout' });
     }
 });
@@ -1269,15 +1403,23 @@ Always think step-by-step and use multiple tools when needed to fully complete t
         // Parse enabled tools
         let parsedEnabledTools = [];
         try {
-            parsedEnabledTools = JSON.parse(enabledTools);
+            const enabledToolsString = req.body.enabledTools || '[]';
+            parsedEnabledTools = JSON.parse(enabledToolsString);
         } catch (e) {
             console.warn('Failed to parse enabled tools:', e);
+            parsedEnabledTools = [];
+        }
+        const allPossibleTools = availableTools;
+        let filteredTools;
+        if (parsedEnabledTools.length > 0) {
+            // If the user has specific tools enabled, filter the master list
+            const enabledToolNames = new Set(parsedEnabledTools);
+            filteredTools = allPossibleTools.filter(tool => enabledToolNames.has(tool.function.name));
+        } else {
+            // If no preferences are set, use ALL tools defined in the master list
+            filteredTools = allPossibleTools;
         }
 
-        // Filter available tools based on enabled tools from user preferences
-        const filteredTools = parsedEnabledTools.length > 0
-            ? availableTools.filter(tool => parsedEnabledTools.includes(tool.function.name))
-            : availableTools;
 
         console.log(`🛠️ Using ${filteredTools.length} tools for model ${model}:`, filteredTools.map(t => t.function.name));
 
@@ -1344,7 +1486,7 @@ Always think step-by-step and use multiple tools when needed to fully complete t
             }
 
             // Get final response
-           const finalCompletion = await openai.chat.completions.create({
+            const finalCompletion = await openai.chat.completions.create({
                 model: model,
                 messages: messages,
                 tools: filteredTools,
@@ -1638,16 +1780,16 @@ app.use((error, req, res, next) => {
 // Start server
 app.listen(PORT, async () => {
     console.log(`🚀 Server running on port ${PORT}`);
+    console.log(`🌐 Environment: ${process.env.NODE_ENV || 'development'}`);
+    console.log(`🔗 Frontend URL: ${process.env.FRONTEND_URL}`);
+    console.log(`🔐 Google OAuth configured: ${!!GOOGLE_CLIENT_ID}`);
 
     // Initialize tools immediately
     availableTools = getAllMCPTools();
     console.log(`✅ Initialized ${availableTools.length} MCP tools`);
 
     // Initialize MCP server
-    setTimeout(() => {
-        console.log('🔧 Initializing MCP server...');
-        initializeMCP();
-    }, 1000);
+    console.log('🟡 Skipping MCP startup — will initialize after user login');
 });
 
 // Graceful shutdown
