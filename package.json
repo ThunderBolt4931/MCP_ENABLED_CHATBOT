@@ -1,0 +1,16 @@
+{
+  "name": "ai-chatbot-monorepo",
+  "private": true,
+  "version": "0.0.0",
+  "scripts": {
+    "dev": "concurrently \"npm run dev:backend\" \"npm run dev:frontend\"",
+    "dev:frontend": "cd frontend && npm run dev",
+    "dev:backend": "cd server && npm run dev",
+    "build:frontend": "cd frontend && npm run build",
+    "start:backend": "cd server && npm start",
+    "install:all": "npm install && cd frontend && npm install && cd ../server && npm install"
+  },
+  "devDependencies": {
+    "concurrently": "^8.2.2"
+  }
+}
