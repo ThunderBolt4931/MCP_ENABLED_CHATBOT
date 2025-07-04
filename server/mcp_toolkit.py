@@ -16,7 +16,7 @@ from email.mime.base import MIMEBase # <--- ADDED
 from email import encoders # <--- ADDED
 
 from google.auth.transport.requests import Request
-from google.oauth2.credentials import Credentials
+from google.oauth2.credentials import Credentials 
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload, MediaFileUpload # <--- MODIFIED
@@ -51,52 +51,49 @@ SCOPES = [
 drive_service = None
 gmail_service = None
 calendar_service = None
+docs_service = None 
 
 # Create FastMCP instance
 mcp = FastMCP("Google Drive & Gmail MCP Server")
 
-CREDENTIALS_PATH = os.getenv('SESSION_TOKEN_PATH', 'token.json')  # Written by server.js
-
 def load_credentials():
-    """Load and refresh credentials using token.json and env client secrets."""
-    if not os.path.exists(CREDENTIALS_PATH):
-        print("token.json not found. Please sign in via the web interface.")
-        return None
+    """Load credentials from environment (from Supabase), not a file."""
+    access_token = os.getenv("GOOGLE_ACCESS_TOKEN")
+    refresh_token = os.getenv("GOOGLE_REFRESH_TOKEN")
+    expires_at = os.getenv("GOOGLE_TOKEN_EXPIRES_AT")
+    client_id = os.getenv("GOOGLE_CLIENT_ID")
+    client_secret = os.getenv("GOOGLE_CLIENT_SECRET")
+
+    if all([access_token, refresh_token, client_id, client_secret]):
+        print(access_token,file=sys.stderr) #debugging
+        print(refresh_token,file=sys.stderr)# debugging
+        print(expires_at,file=sys.stderr) #debugging
+        print(client_id,file=sys.stderr)
+        
+        print("got all required environment variables for Google OAuth",file=sys.stderr)
 
     try:
-        with open(CREDENTIALS_PATH, 'r') as token_file:
-            token_data = json.load(token_file)
-
-        client_id = os.getenv("GOOGLE_CLIENT_ID")
-        client_secret = os.getenv("GOOGLE_CLIENT_SECRET")
-
-        if not client_id or not client_secret:
-            print("Missing GOOGLE_CLIENT_ID or GOOGLE_CLIENT_SECRET in environment.")
-            return None
-
         creds = Credentials(
-            token=token_data.get("access_token"),
-            refresh_token=token_data.get("refresh_token"),
+            token=access_token,
+            refresh_token=refresh_token,
             token_uri="https://oauth2.googleapis.com/token",
             client_id=client_id,
             client_secret=client_secret,
             scopes=SCOPES
         )
 
+        # Manually set expiration if available
+        if expires_at:
+            creds.expiry = datetime.utcfromtimestamp(int(expires_at) / 1000)
+
         if creds and creds.expired and creds.refresh_token:
-            print("🔁 Refreshing access token...")
+            print("🔁 Refreshing token...",file=sys.stderr)
             creds.refresh(Request())
-            # Save updated token
-            with open(CREDENTIALS_PATH, 'w') as token_file:
-                token_file.write(creds.to_json())
 
-        print("Google credentials loaded successfully")
         return creds
-
     except Exception as e:
-        print(f"Error loading credentials: {e}")
+        print("❌ Error loading credentials:", e,file=sys.stderr)
         return None
-
 # ==================== GOOGLE DRIVE FUNCTIONS ====================
 
 def get_export_mime_type(google_mime_type: str) -> str:
@@ -802,7 +799,6 @@ def drive_create(name: str, mimeType: str, content: str, folder_id: Optional[str
 
         # Special handling for Google Docs - create the doc then insert text.
         if mimeType == 'application/vnd.google-apps.document':
-            docs_service = build('docs', 'v1', credentials=load_credentials())
             
             # Create an empty document first
             doc_file = drive_service.files().create(body=file_metadata).execute()
@@ -1344,8 +1340,17 @@ def gmail_search_and_summarize(
 def gmail_send_message(to: str, subject: str, body: str) -> str:
     """Send a simple email"""
     try:
-        profile = gmail_service.users().getProfile(userId='me').execute()
-        from_email = profile['emailAddress']
+        # Add service validation
+        if gmail_service is None:
+            return "Error: Gmail service not initialized. Please re-authenticate."
+        
+        # Test the service connection first
+        try:
+            profile = gmail_service.users().getProfile(userId='me').execute()
+            from_email = profile['emailAddress']
+            print(f"yeri teri profile {profile}",file=sys.stderr)
+        except Exception as auth_error:
+            return f"Error: Gmail authentication failed. Please re-authenticate. Details: {str(auth_error)}"
         
         msg = MIMEText(body)
         msg['to'] = to
@@ -1757,46 +1762,47 @@ def calendar_delete_event(event_id: str) -> str:
         return f"Error deleting event: {str(e)}"
 
 def initialize_services():
-    """Initialize both Google Drive and Gmail services."""
-    global drive_service, gmail_service, calendar_service
+    """Initialize all Google services."""
+    global drive_service, gmail_service, calendar_service, docs_service
     
     creds = load_credentials()
     if not creds:
-        print("Warning: No credentials available. Services will not be initialized until user authenticates.")
+        print("Warning: No credentials available. Services will not be initialized.",file=sys.stderr)
         return
     
-    # Initialize Google Drive service
-    drive_service = build('drive', 'v3', credentials=creds)
-    print("Google Drive service initialized")
-    
-    # Initialize Gmail service
-    gmail_service = build('gmail', 'v1', credentials=creds)
-    calendar_service = build('calendar', 'v3', credentials=creds)
     try:
+        # Initialize Google Drive service
+        drive_service = build('drive', 'v3', credentials=creds)
+        print("✅ Google Drive service initialized",file=sys.stderr)
+        
+        # Initialize Gmail service
+        gmail_service = build('gmail', 'v1', credentials=creds)
+        profile = gmail_service.users().getProfile(userId='me').execute()
+        print(f"✅ Gmail service initialized: {profile['emailAddress']}",file=sys.stderr)
+        
+        # Initialize Calendar service
+        calendar_service = build('calendar', 'v3', credentials=creds)
         calendar_list = calendar_service.calendarList().list().execute()
         primary_calendar = next((cal for cal in calendar_list.get('items', []) if cal.get('primary')), None)
         if primary_calendar:
-            print(f"Google Calendar service initialized: {primary_calendar.get('summary', 'Primary Calendar')}")
-        else:
-            print("Google Calendar service initialized")
+            print(f"✅ Google Calendar service initialized: {primary_calendar.get('summary', 'Primary Calendar')}",file=sys.stderr)
+        
+        # Initialize Docs service
+        docs_service = build('docs', 'v1', credentials=creds)
+        print("✅ Google Docs service initialized",file=sys.stderr)
+
+        if not PDF_SUPPORT:
+            print("⚠️ PDF libraries not installed. PDF creation/editing will be limited.", file=sys.stderr)
+        
+        print("\n🚀 Server ready with Google Drive, Gmail, Calendar, and Docs integration",file=sys.stderr)
+
     except HttpError as e:
-        print(f"Calendar connection test failed: {e}")
-        raise
-    
-    # Test Gmail connection
-    try:
-        profile = gmail_service.users().getProfile(userId='me').execute()
-        print(f"Gmail service initialized: {profile['emailAddress']}")
-    except HttpError as e:
-        print(f"Gmail connection test failed: {e}")
-        raise
-    
-    if not PDF_SUPPORT:
-        print("PDF libraries not installed. PDF creation/editing will be limited.", file=sys.stderr)
-        print("Install with: pip install PyPDF2 reportlab", file=sys.stderr)
-    
-    print("Server ready with Google Drive, Gmail, and Calendar integration")
+        print(f"❌ A Google API error occurred during initialization: {e}",file=sys.stderr)
+        # Depending on severity, you might want to exit or handle this
+    except Exception as e:
+        print(f"❌ An unexpected error occurred during initialization: {e}",file=sys.stderr)
 
 if __name__ == "__main__":
     initialize_services()
+    print("MCP Toolkit started. Waiting for initialization command...", file=sys.stderr)
     mcp.run(transport="stdio")
