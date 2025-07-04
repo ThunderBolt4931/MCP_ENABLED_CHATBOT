@@ -1220,10 +1220,13 @@ app.post('/auth/logout', async (req, res) => {
 });
 
 // Chat endpoint with database integration
+// Chat endpoint with database integration
 app.post('/api/chat', requireAuth, upload.array('attachments', 5), async (req, res) => {
     try {
         const { message, chatId, model = 'gpt-4', enabledTools = '[]' } = req.body;
-        const userId = req.session.user.id;
+        
+        // Fix: Get userId from req.user (set by requireAuth middleware) instead of req.session.user
+        const userId = req.user.id;
         const files = req.files || [];
 
         console.log(`📝 Chat request received:`, {
@@ -1289,7 +1292,7 @@ app.post('/api/chat', requireAuth, upload.array('attachments', 5), async (req, r
                 await Attachment.create({
                     messageId: null, // Will be updated after message creation
                     userId: userId,
-                    filename: uploadResult.filename, // This should never be null now
+                    filename: uploadResult.filename,
                     originalName: uploadResult.originalName,
                     mimeType: uploadResult.mimeType,
                     fileSize: uploadResult.fileSize,
@@ -1314,7 +1317,6 @@ app.post('/api/chat', requireAuth, upload.array('attachments', 5), async (req, r
             ).join('\n\n');
             userMessageContent = message ? `${message}\n\nUploaded Files:\n${fileDescriptions}` : `Uploaded Files:\n${fileDescriptions}`;
         }
-
 
         // Get chat history for context
         const chatHistory = await Message.findByChatId(currentChatId);
@@ -1355,6 +1357,7 @@ Always think step-by-step and use multiple tools when needed to fully complete t
                 content: msg.content
             });
         });
+
         // Save user message
         const userMessage = await Message.create({
             chatId: currentChatId,
@@ -1374,7 +1377,6 @@ Always think step-by-step and use multiple tools when needed to fully complete t
         messages.push(userMessage);
         console.log(`💬 Processing chat for user ${userId}, chat ${currentChatId}`);
         console.log(`🛠️  Available tools: ${availableTools.length}`);
-
 
         // Parse enabled tools
         let parsedEnabledTools = [];
@@ -1454,7 +1456,7 @@ Always think step-by-step and use multiple tools when needed to fully complete t
             }
 
             // Get final response
-           const finalCompletion = await openai.chat.completions.create({
+            const finalCompletion = await openai.chat.completions.create({
                 model: model,
                 messages: messages,
                 tools: filteredTools,
@@ -1462,9 +1464,11 @@ Always think step-by-step and use multiple tools when needed to fully complete t
                 temperature: 0.7,
                 max_tokens: 3000
             });
+
             let currentResponse = finalCompletion.choices[0].message;
             let maxIterations = 5; // Prevent infinite loops
             let iterations = 0;
+
             while (currentResponse.tool_calls && currentResponse.tool_calls.length > 0 && iterations < maxIterations) {
                 iterations++;
                 console.log(`🔧 Processing additional tool calls (iteration ${iterations})`);
@@ -1505,12 +1509,14 @@ Always think step-by-step and use multiple tools when needed to fully complete t
 
                 currentResponse = nextCompletion.choices[0].message;
             }
+
             if (finalCompletion.usage) {
                 totalInputTokens += finalCompletion.usage.prompt_tokens || 0;
                 totalOutputTokens += finalCompletion.usage.completion_tokens || 0;
 
                 console.log(`📊 Final API Call - Input tokens: ${finalCompletion.usage.prompt_tokens}, Output tokens: ${finalCompletion.usage.completion_tokens}`);
             }
+
             finalResponse = currentResponse.content;
         }
 
@@ -1578,12 +1584,11 @@ Always think step-by-step and use multiple tools when needed to fully complete t
         });
     }
 });
-
 // Get chat history
 app.get('/api/chat/:chatId', requireAuth, async (req, res) => {
     try {
         const { chatId } = req.params;
-        const userId = req.session.user.id;
+        const userId = req.user.id; // Fixed: use req.user instead of req.session.user
 
         const chat = await Chat.getWithMessages(chatId, userId);
 
@@ -1597,13 +1602,12 @@ app.get('/api/chat/:chatId', requireAuth, async (req, res) => {
         res.status(500).json({ error: 'Failed to load chat' });
     }
 });
-
 // Get user chats
 app.get('/api/chats/:userId', requireAuth, async (req, res) => {
     try {
         const { userId } = req.params;
 
-        if (userId !== req.session.user.id) {
+        if (userId !== req.user.id) { // Fixed: use req.user instead of req.session.user
             return res.status(403).json({ error: 'Access denied' });
         }
 
@@ -1619,7 +1623,7 @@ app.get('/api/chats/:userId', requireAuth, async (req, res) => {
 app.delete('/api/chat/:chatId', requireAuth, async (req, res) => {
     try {
         const { chatId } = req.params;
-        const userId = req.session.user.id;
+        const userId = req.user.id; // Fixed: use req.user instead of req.session.user
 
         // Verify chat belongs to user
         const chat = await Chat.findById(chatId);
@@ -1669,7 +1673,7 @@ app.post('/api/mcp/restart', requireAuth, (req, res) => {
 // User preferences
 app.get('/api/user/preferences', requireAuth, async (req, res) => {
     try {
-        const preferences = await User.getPreferences(req.session.user.id);
+        const preferences = await User.getPreferences(req.user.id); // Fixed: use req.user instead of req.session.user
         res.json(preferences || {
             preferred_model: 'gpt-4',
             enabled_tools: [],
@@ -1683,7 +1687,7 @@ app.get('/api/user/preferences', requireAuth, async (req, res) => {
 
 app.put('/api/user/preferences', requireAuth, async (req, res) => {
     try {
-        const preferences = await User.updatePreferences(req.session.user.id, req.body);
+        const preferences = await User.updatePreferences(req.user.id, req.body); // Fixed: use req.user instead of req.session.user
         res.json(preferences);
     } catch (error) {
         console.error('Error updating preferences:', error);
@@ -1726,7 +1730,7 @@ app.get('/api/attachments/:attachmentId/download', requireAuth, async (req, res)
         }
 
         // Check if user has access to this attachment
-        if (attachment.user_id !== req.session.user.id) {
+        if (attachment.user_id !== req.user.id) { // Fixed: use req.user instead of req.session.user
             return res.status(403).json({ error: 'Access denied' });
         }
 
@@ -1738,6 +1742,7 @@ app.get('/api/attachments/:attachmentId/download', requireAuth, async (req, res)
         res.status(500).json({ error: 'Failed to download attachment' });
     }
 });
+
 
 // Error handling middleware
 app.use((error, req, res, next) => {
