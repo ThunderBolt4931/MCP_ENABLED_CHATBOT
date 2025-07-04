@@ -1,5 +1,5 @@
-import React, { useState } from 'react';
-import { Link, useNavigate } from 'react-router-dom';
+import React, { useState, useEffect } from 'react';
+import { Link, useNavigate, useSearchParams } from 'react-router-dom';
 import { Mail, Lock, Github } from 'lucide-react';
 import { Button } from '../ui/Button';
 import { Input } from '../ui/Input';
@@ -11,9 +11,30 @@ export const LoginPage: React.FC = () => {
   const [password, setPassword] = useState('');
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState('');
+  const [searchParams] = useSearchParams();
   
   const navigate = useNavigate();
   const { setUser } = useAuthStore();
+
+  useEffect(() => {
+    // Check for error in URL params
+    const urlError = searchParams.get('error');
+    if (urlError) {
+      switch (urlError) {
+        case 'no_code':
+          setError('Authorization failed. Please try again.');
+          break;
+        case 'auth_failed':
+          setError('Authentication failed. Please try again.');
+          break;
+        case 'no_token':
+          setError('Authentication token missing. Please try again.');
+          break;
+        default:
+          setError('Login failed. Please try again.');
+      }
+    }
+  }, [searchParams]);
 
   const handleEmailLogin = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -41,21 +62,12 @@ export const LoginPage: React.FC = () => {
       setIsLoading(true);
       setError('');
       
-      // If your Google login returns user data directly
-      const response = await authAPI.googleLogin();
+      // Redirect to Google OAuth
+      authAPI.googleLogin();
       
-      if (response && response.data && response.data.user) {
-        setUser(response.data.user);
-        navigate('/chat');
-      } else {
-        // If Google login redirects to a callback URL, you might not need to navigate here
-        // The redirect will handle the navigation after successful authentication
-        console.log('Google login initiated');
-      }
     } catch (error: any) {
       console.error('Google login failed:', error);
       setError('Google login failed. Please try again.');
-    } finally {
       setIsLoading(false);
     }
   };
