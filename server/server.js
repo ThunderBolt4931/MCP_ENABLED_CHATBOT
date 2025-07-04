@@ -688,13 +688,41 @@ const getAllMCPTools = () => [
 ];
 
 // Initialize MCP Server
-function initializeMCP() {
+async function initializeMCP(userId) {
+    if (!userId) {
+        console.error('❌ Cannot start MCP without userId');
+        return;
+    }
+    currentUserId = userId;
+
     const mcpPath = path.join(__dirname, 'mcp_toolkit.py');
+
+    let tokenData;
+    try {
+        tokenData = await AuthToken.findByUserId(userId);
+        if (!tokenData) throw new Error('No auth token found for user');
+    } catch (err) {
+        console.error('❌ Failed to load token from Supabase:', err.message);
+        return;
+    }
+
+    const mcpEnv = {
+        ...process.env,
+        PYTHONUNBUFFERED: '1',
+        GOOGLE_ACCESS_TOKEN: tokenData.access_token,
+        GOOGLE_REFRESH_TOKEN: tokenData.refresh_token,
+        GOOGLE_TOKEN_EXPIRES_AT: new Date(tokenData.expires_at).getTime().toString(),
+        SESSION_USER_ID: userId
+    };
+    console.log('🔐 Starting MCP with tokens:', {
+        access: tokenData.access_token?.substring(0, 5) + '...',
+        refresh: tokenData.refresh_token?.substring(0, 5) + '...',
+        expires: tokenData.expires_at
+    });
     mcpProcess = spawn('python', [mcpPath], {
         stdio: ['pipe', 'pipe', 'pipe'],
-        env: { ...process.env, PYTHONUNBUFFERED: '1' }
+        env: mcpEnv
     });
-
     let outputBuffer = '';
 
     mcpProcess.stdout.on('data', (data) => {
@@ -733,25 +761,16 @@ function initializeMCP() {
             }
         }
     });
-
     mcpProcess.stderr.on('data', (data) => {
-        const error = data.toString();
-        if (!error.includes('file_cache') && !error.includes('oauth2client') && !error.includes('WARNING')) {
-            console.error('❌ MCP Error:', error);
-        }
+        // This will print any and all messages from Python's stderr stream
+        console.error(`[PYTHON STDERR]: ${data.toString()}`);
     });
+    // --- END OF ADDED BLOCK ---
 
+    // It's also good practice to know if the process closes unexpectedly
     mcpProcess.on('close', (code) => {
-        console.log(`🔄 MCP process exited with code ${code}`);
-        mcpReady = false;
-        setTimeout(() => {
-            console.log('🔄 Attempting to restart MCP server...');
-            initializeMCP();
-        }, 5000);
-    });
-
-    mcpProcess.on('error', (error) => {
-        console.error('❌ MCP Process Error:', error);
+        console.log(`MCP process exited with code ${code}`);
+        mcpProcess = null; // Clear the process variable
         mcpReady = false;
     });
 
@@ -766,7 +785,7 @@ function restartMCP() {
         mcpProcess.kill();
     }
     setTimeout(() => {
-        initializeMCP();
+        initializeMCP(user.Id);
     }, 1000);
 }
 
@@ -1729,17 +1748,18 @@ app.use((error, req, res, next) => {
 // Start server
 app.listen(PORT, async () => {
     console.log(`🚀 Server running on port ${PORT}`);
+    console.log(`🌐 Environment: ${process.env.NODE_ENV || 'development'}`);
+    console.log(`🔗 Frontend URL: ${process.env.FRONTEND_URL}`);
+    console.log(`🔐 Google OAuth configured: ${!!GOOGLE_CLIENT_ID}`);
 
     // Initialize tools immediately
     availableTools = getAllMCPTools();
     console.log(`✅ Initialized ${availableTools.length} MCP tools`);
 
     // Initialize MCP server
-    setTimeout(() => {
-        console.log('🔧 Initializing MCP server...');
-        initializeMCP();
-    }, 1000);
+    console.log('🟡 Skipping MCP startup — will initialize after user login');
 });
+
 
 // Graceful shutdown
 process.on('SIGINT', () => {
