@@ -912,8 +912,7 @@ async function callMCPTool(toolName, params) {
         console.log(`🔧 Calling MCP tool: ${toolName}`, params);
 
         if (!mcpReady) {
-            // Provide demo responses when MCP is not ready
-            return getDemoToolResponse(toolName, params);
+            throw new Error('MCP server is not ready. Please wait for the server to initialize.');
         }
 
         const result = await sendMCPRequest('tools/call', {
@@ -938,65 +937,8 @@ async function callMCPTool(toolName, params) {
         }
     } catch (error) {
         console.error(`❌ Error calling tool ${toolName}:`, error);
-        // Fallback to demo response on error
-        return getDemoToolResponse(toolName, params);
+        throw error; // Re-throw the error instead of falling back to demo
     }
-}
-
-function getDemoToolResponse(toolName, params) {
-    const demoResponses = {
-        // Google Drive
-        'drive_search': `Demo: Found 3 files matching "${params.query}": Document1.docx, Spreadsheet1.xlsx, Presentation1.pptx`,
-        'drive_list_files': 'Demo: Listed 10 files from Google Drive: file1.pdf, file2.docx, file3.xlsx...',
-        'drive_read_file': `Demo: Reading file content for ${params.file_id}. Content: "This is sample file content..."`,
-        'drive_create_file': `Demo: Created file "${params.name}" successfully. File ID: demo_file_123`,
-        'drive_update_file': `Demo: Updated file ${params.file_id} with new content`,
-        'drive_delete_file': `Demo: Deleted file ${params.file_id} successfully`,
-        'drive_share_file': `Demo: Shared file ${params.file_id} with ${params.email} as ${params.role}`,
-        'drive_upload_file': `Demo: Uploaded file from ${params.file_path} to Google Drive`,
-        'drive_create_folder': `Demo: Created folder "${params.name}" successfully`,
-        'drive_get_file_metadata': `Demo: File metadata for ${params.file_id}: Name: Sample.pdf, Size: 1.2MB, Modified: Today`,
-
-        // Gmail
-        'gmail_send_message': `Demo: Email sent to ${params.to} with subject "${params.subject}"`,
-        'gmail_search_messages': `Demo: Found 5 messages matching "${params.query}"`,
-        'gmail_read_message': `Demo: Message content: "This is a sample email message..."`,
-        'gmail_list_messages': 'Demo: Listed 10 recent messages from Gmail inbox',
-        'gmail_send_file_attachment': `Demo: Email with attachment sent to ${params.to}`,
-        'gmail_list_labels': 'Demo: Labels: Inbox, Sent, Drafts, Important, Work, Personal',
-        'gmail_mark_as_read': `Demo: Marked ${params.message_ids.length} messages as read`,
-        'gmail_add_label': `Demo: Added labels to ${params.message_ids.length} messages`,
-
-        // Calendar
-        'calendar_create_event': `Demo: Created event "${params.summary}" for ${params.start_time}`,
-        'calendar_list_events': 'Demo: Upcoming events: Meeting at 2PM, Call at 4PM, Dinner at 7PM',
-        'calendar_update_event': `Demo: Updated event ${params.event_id}`,
-        'calendar_delete_event': `Demo: Deleted event ${params.event_id}`,
-        'calendar_get_free_busy': `Demo: Free/busy status for ${params.emails.join(', ')}: Available 9-11AM, Busy 2-4PM`,
-        'calendar_find_meeting_time': `Demo: Available meeting slots: 10AM-11AM, 3PM-4PM tomorrow`,
-
-        // Google Docs
-        'docs_create_document': `Demo: Created document "${params.title}" successfully`,
-        'docs_read_document': `Demo: Document content: "This is sample document content..."`,
-        'docs_update_document': `Demo: Updated document ${params.document_id} with new content`,
-        'docs_export_document': `Demo: Exported document ${params.document_id} as ${params.format}`,
-
-        // Google Sheets
-        'sheets_create_spreadsheet': `Demo: Created spreadsheet "${params.title}" successfully`,
-        'sheets_read_range': `Demo: Data from ${params.range}: [["Name", "Age"], ["John", "25"], ["Jane", "30"]]`,
-        'sheets_write_range': `Demo: Wrote data to ${params.range} successfully`,
-        'sheets_append_data': `Demo: Appended ${params.values.length} rows to spreadsheet`,
-
-        // File Analysis
-        'analyze_file': `Demo: Analyzed file ${params.file_path}. Type: ${params.analysis_type || 'content'}. Results: File contains text, images, and metadata.`,
-        'extract_text_from_pdf': `Demo: Extracted text from PDF: "This is sample PDF content extracted from ${params.file_path}..."`,
-        'extract_text_from_docx': `Demo: Extracted text from Word document: "Sample document content..."`,
-        'analyze_image': `Demo: Image analysis of ${params.file_path}: Resolution: 1920x1080, Format: PNG, Contains: text, objects`,
-        'extract_data_from_csv': `Demo: CSV data extracted: 100 rows, 5 columns (Name, Age, City, Email, Phone)`,
-        'convert_file_format': `Demo: Converted ${params.input_file_path} to ${params.output_format} format`
-    };
-
-    return demoResponses[toolName] || `Demo: Executed ${toolName} with parameters: ${JSON.stringify(params)}`;
 }
 
 // Authentication middleware
@@ -1220,7 +1162,6 @@ app.post('/auth/logout', async (req, res) => {
 });
 
 // Chat endpoint with database integration
-// Chat endpoint with database integration
 app.post('/api/chat', requireAuth, upload.array('attachments', 5), async (req, res) => {
     try {
         const { message, chatId, model = 'gpt-4', enabledTools = '[]' } = req.body;
@@ -1241,10 +1182,18 @@ app.post('/api/chat', requireAuth, upload.array('attachments', 5), async (req, r
             return res.status(400).json({ error: 'Message or attachments required' });
         }
 
+        // Check if MCP is ready before proceeding
+        if (!mcpReady) {
+            return res.status(503).json({ 
+                error: 'MCP server is not ready. Please wait for the server to initialize.',
+                mcpReady: false 
+            });
+        }
+
         // Initialize tools if not already done
         if (availableTools.length === 0) {
             console.log('🔧 Initializing tools...');
-            availableTools = getAllMCPTools();
+            await getAvailableTools(); // Wait for tools to be loaded
             console.log(`✅ Initialized ${availableTools.length} tools`);
         }
 
@@ -1336,7 +1285,7 @@ app.post('/api/chat', requireAuth, upload.array('attachments', 5), async (req, r
 - When users ask you to "create a document and send it to someone", do BOTH actions
 - Break down complex requests into multiple tool calls
 - Always explain what you're doing step by step
-- If a tool call fails, try an alternative approach
+- If a tool call fails, inform the user and suggest alternatives
 
 **Multi-step Example Workflows:**
 - Create document → Share with user → Send email with link
@@ -1481,6 +1430,7 @@ Always think step-by-step and use multiple tools when needed to fully complete t
                         const toolArgs = JSON.parse(toolCall.function.arguments);
 
                         const result = await callMCPTool(toolName, toolArgs);
+                        toolsUsed.push(toolName);
 
                         messages.push({
                             role: "tool",
@@ -1488,12 +1438,15 @@ Always think step-by-step and use multiple tools when needed to fully complete t
                             name: toolName,
                             content: result
                         });
+
+                        console.log(`✅ Tool ${toolName} completed successfully`);
                     } catch (error) {
+                        console.error(`❌ Tool ${toolCall.function.name} failed:`, error);
                         messages.push({
                             role: "tool",
                             tool_call_id: toolCall.id,
                             name: toolCall.function.name,
-                            content: `Error: ${error.message}`
+                            content: `Error executing ${toolCall.function.name}: ${error.message}`
                         });
                     }
                 }
@@ -1508,6 +1461,12 @@ Always think step-by-step and use multiple tools when needed to fully complete t
                 });
 
                 currentResponse = nextCompletion.choices[0].message;
+
+                // Track tokens from additional completions
+                if (nextCompletion.usage) {
+                    totalInputTokens += nextCompletion.usage.prompt_tokens || 0;
+                    totalOutputTokens += nextCompletion.usage.completion_tokens || 0;
+                }
             }
 
             if (finalCompletion.usage) {
