@@ -52,8 +52,7 @@ const corsOptions = {
 
 // Apply CORS middleware BEFORE other middleware
 app.use(cors(corsOptions));
-// Middleware
-app.use(cors(corsOptions));
+=
 
 app.use(session({
   secret: process.env.SESSION_SECRET || 'your-secret-key-here',
