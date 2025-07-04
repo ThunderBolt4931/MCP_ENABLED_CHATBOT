@@ -10,12 +10,47 @@ const api = axios.create({
   },
 });
 
+// Add request interceptor to include JWT token
+api.interceptors.request.use(
+  (config) => {
+    // Get token from localStorage or from auth store
+    const token = localStorage.getItem('auth-token') || 
+                  JSON.parse(localStorage.getItem('auth-storage') || '{}')?.state?.token;
+    
+    if (token) {
+      config.headers.Authorization = `Bearer ${token}`;
+    }
+    return config;
+  },
+  (error) => {
+    return Promise.reject(error);
+  }
+);
+
+// Add response interceptor to handle auth errors
+api.interceptors.response.use(
+  (response) => response,
+  (error) => {
+    if (error.response?.status === 401) {
+      // Clear auth state on 401 errors
+      localStorage.removeItem('auth-storage');
+      localStorage.removeItem('auth-token');
+      window.location.href = '/login';
+    }
+    return Promise.reject(error);
+  }
+);
+
 // Auth API
 export const authAPI = {
   checkAuth: () => api.get('/auth/user'),
   logout: () => api.post('/auth/logout'),
   googleLogin: () => {
     window.location.href = `${API_BASE_URL}/auth/google`;
+  },
+  login: async (credentials: { email: string; password: string }) => {
+    // This would be for email/password login if you implement it
+    return api.post('/auth/login', credentials);
   },
   updatePreferences: (preferences: any) => api.put('/api/user/preferences', preferences),
   getPreferences: () => api.get('/api/user/preferences'),
