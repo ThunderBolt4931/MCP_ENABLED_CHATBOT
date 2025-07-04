@@ -8,7 +8,7 @@ interface ProtectedRouteProps {
 }
 
 export const ProtectedRoute: React.FC<ProtectedRouteProps> = ({ children }) => {
-  const { isAuthenticated, user, setUser, setLoading } = useAuthStore();
+  const { isAuthenticated, user, token, setUser, setLoading } = useAuthStore();
   const [isChecking, setIsChecking] = useState(true);
   const location = useLocation();
 
@@ -18,14 +18,21 @@ export const ProtectedRoute: React.FC<ProtectedRouteProps> = ({ children }) => {
         console.log('🔍 Checking authentication status...');
         setIsChecking(true);
         
-        const response = await authAPI.checkAuth();
-        console.log('Auth check response:', response.data);
-        
-        if (response.data.authenticated && response.data.user) {
-          console.log('✅ User authenticated:', response.data.user.email);
-          setUser(response.data.user);
+        // If we have a token, try to verify it
+        if (token) {
+          console.log('🔑 Token found, verifying...');
+          const response = await authAPI.checkAuth();
+          console.log('Auth check response:', response.data);
+          
+          if (response.data.authenticated && response.data.user) {
+            console.log('✅ User authenticated via token:', response.data.user.email);
+            setUser(response.data.user);
+          } else {
+            console.log('❌ Token invalid, clearing auth state');
+            setUser(null);
+          }
         } else {
-          console.log('❌ User not authenticated');
+          console.log('❌ No token found');
           setUser(null);
         }
       } catch (error) {
@@ -39,7 +46,7 @@ export const ProtectedRoute: React.FC<ProtectedRouteProps> = ({ children }) => {
 
     // Always check auth status when component mounts
     checkAuth();
-  }, [setUser, setLoading]);
+  }, [token, setUser, setLoading]);
 
   // Show loading spinner while checking authentication
   if (isChecking) {
