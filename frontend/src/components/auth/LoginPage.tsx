@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { Link, useNavigate, useSearchParams } from 'react-router-dom';
+import { Link, useNavigate, useLocation } from 'react-router-dom';
 import { Mail, Lock, Github } from 'lucide-react';
 import { Button } from '../ui/Button';
 import { Input } from '../ui/Input';
@@ -11,30 +11,41 @@ export const LoginPage: React.FC = () => {
   const [password, setPassword] = useState('');
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState('');
-  const [searchParams] = useSearchParams();
   
   const navigate = useNavigate();
-  const { setUser } = useAuthStore();
+  const location = useLocation();
+  const { setUser, isAuthenticated } = useAuthStore();
 
+  // Handle OAuth callback
   useEffect(() => {
-    // Check for error in URL params
-    const urlError = searchParams.get('error');
-    if (urlError) {
-      switch (urlError) {
-        case 'no_code':
-          setError('Authorization failed. Please try again.');
-          break;
-        case 'auth_failed':
-          setError('Authentication failed. Please try again.');
-          break;
-        case 'no_token':
-          setError('Authentication token missing. Please try again.');
-          break;
-        default:
-          setError('Login failed. Please try again.');
-      }
+    const urlParams = new URLSearchParams(window.location.search);
+    const success = urlParams.get('success');
+    const error = urlParams.get('error');
+    
+    if (success === 'true') {
+      // OAuth was successful, check auth status
+      checkAuthStatus();
+    } else if (error) {
+      setError(decodeURIComponent(error));
+      // Clear error from URL
+      window.history.replaceState({}, document.title, '/login');
     }
-  }, [searchParams]);
+  }, []);
+
+  const checkAuthStatus = async () => {
+    try {
+      const response = await authAPI.checkAuth();
+      if (response.data.authenticated && response.data.user) {
+        setUser(response.data.user);
+        // Get redirect path from localStorage or use default
+        const redirectPath = localStorage.getItem('redirect_after_auth') || '/chat';
+        localStorage.removeItem('redirect_after_auth');
+        navigate(redirectPath);
+      }
+    } catch (error) {
+      console.error('Auth check failed:', error);
+    }
+  };
 
   const handleEmailLogin = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -42,12 +53,12 @@ export const LoginPage: React.FC = () => {
     setError('');
     
     try {
-      // Replace this with your actual email/password login API call
       const response = await authAPI.login({ email, password });
       
       if (response.data.user) {
         setUser(response.data.user);
-        navigate('/chat'); // Navigate to chat after successful login
+        const from = location.state?.from?.pathname || '/chat';
+        navigate(from, { replace: true });
       }
     } catch (error: any) {
       console.error('Login failed:', error);
@@ -62,15 +73,20 @@ export const LoginPage: React.FC = () => {
       setIsLoading(true);
       setError('');
       
-      // Redirect to Google OAuth
+      // Google login will redirect to backend OAuth endpoint
       authAPI.googleLogin();
-      
     } catch (error: any) {
       console.error('Google login failed:', error);
       setError('Google login failed. Please try again.');
       setIsLoading(false);
     }
   };
+
+  // If already authenticated, redirect
+  if (isAuthenticated) {
+    navigate('/chat', { replace: true });
+    return null;
+  }
 
   return (
     <div className="min-h-screen flex">
@@ -81,7 +97,7 @@ export const LoginPage: React.FC = () => {
             <div className="w-8 h-8 bg-gray-900 rounded-lg flex items-center justify-center mr-3">
               <div className="w-4 h-4 bg-white rounded-sm"></div>
             </div>
-            <span className="text-xl font-semibold text-gray-900">Chat Bot</span>
+            <span className="text-xl font-semibold text-gray-900">MCP Chat Bot</span>
           </div>
           <h1 className="text-4xl font-bold text-gray-900 mb-6">
             Welcome to MCP Chat Bot
@@ -148,6 +164,7 @@ export const LoginPage: React.FC = () => {
               className="w-full"
               loading={isLoading}
               size="lg"
+              disabled={isLoading}
             >
               Sign in
             </Button>
@@ -170,6 +187,7 @@ export const LoginPage: React.FC = () => {
                 className="w-full"
                 size="lg"
                 loading={isLoading}
+                disabled={isLoading}
               >
                 <svg className="w-5 h-5 mr-2" viewBox="0 0 24 24">
                   <path fill="#4285F4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z"/>
@@ -185,7 +203,7 @@ export const LoginPage: React.FC = () => {
                 className="w-full"
                 size="lg"
                 icon={Github}
-                disabled={isLoading}
+                disabled={true}
               >
                 GitHub
               </Button>
