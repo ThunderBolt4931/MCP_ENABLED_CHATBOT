@@ -1,5 +1,6 @@
 const express = require('express');
 const cors = require('cors');
+const jwt = require('jsonwebtoken');
 const { OpenAI } = require('openai');
 const { spawn } = require('child_process');
 const path = require('path');
@@ -21,14 +22,16 @@ const PORT = process.env.PORT || 3000;
 const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID;
 const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET;
 const GOOGLE_REDIRECT_URI = process.env.GOOGLE_REDIRECT_URI || 'http://localhost:3000/auth/google/callback';
-
+const JWT_SECRET = process.env.JWT_SECRET || 'your-super-secret-jwt-key';
 const googleClient = new OAuth2Client(GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REDIRECT_URI);
-
+const corsOptions = {
+    origin: process.env.FRONTEND_URL, // Your Vercel frontend URL
+    credentials: true,
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'Cookie'],
+};
 // Middleware
-app.use(cors({
-    origin: process.env.FRONTEND_URL,
-    credentials: true
-}));
+app.use(cors(corsOptions));
 app.use(express.json({ limit: '50mb' }));
 app.use(session({
     secret: process.env.SESSION_SECRET || 'your-secret-key-here',
@@ -40,6 +43,26 @@ app.use(session({
         maxAge: 24 * 60 * 60 * 1000 // 24 hours
     }
 }));
+const generateJWT = (user) => {
+    return jwt.sign(
+        { 
+            id: user.id, 
+            email: user.email, 
+            name: user.name, 
+            picture: user.picture 
+        },
+        JWT_SECRET,
+        { expiresIn: '24h' }
+    );
+};
+
+const verifyJWT = (token) => {
+    try {
+        return jwt.verify(token, JWT_SECRET);
+    } catch (error) {
+        return null;
+    }
+};
 
 // OpenAI client
 const openai = new OpenAI({
@@ -936,9 +959,18 @@ function getDemoToolResponse(toolName, params) {
 
 // Authentication middleware
 const requireAuth = (req, res, next) => {
-    if (!req.session.user) {
+    const token = req.headers.authorization?.split(' ')[1]; // Bearer token
+    
+    if (!token) {
         return res.status(401).json({ error: 'Authentication required' });
     }
+    
+    const decoded = verifyJWT(token);
+    if (!decoded) {
+        return res.status(401).json({ error: 'Invalid token' });
+    }
+    
+    req.user = decoded;
     next();
 };
 
@@ -1031,7 +1063,10 @@ app.get('/auth/google/callback', async (req, res) => {
             });
         }
 
-        // Store user session
+        // Generate JWT token
+        const jwtToken = generateJWT(user);
+
+        // Store user session (fallback for same-domain scenarios)
         req.session.user = {
             id: user.id,
             email: user.email,
@@ -1039,17 +1074,18 @@ app.get('/auth/google/callback', async (req, res) => {
             picture: user.picture
         };
 
-        // Store tokens in session for immediate use
-        req.session.tokens = tokens;
-
         console.log('💾 User session created successfully');
+        
+        try {
+            await initializeMCP(user.id);
+            console.log("MCP initialized successfully");
+        } catch (error) {
+            console.log("MCP initialization error:", error);
+        }
 
-        // Save OAuth tokens for MCP toolkit
-        await fs.writeFile(path.join(__dirname, 'token.json'), JSON.stringify(tokens, null, 2));
-        restartMCP();
-
-        console.log('🔄 Redirecting to chat interface...');
-        res.redirect(`${process.env.FRONTEND_URL}/chat`);
+        // Redirect with JWT token as query parameter
+        console.log('🔄 Redirecting to chat interface with JWT...');
+        res.redirect(`${process.env.FRONTEND_URL}/auth/callback?token=${jwtToken}`);
 
     } catch (error) {
         console.error('❌ Google OAuth callback error:', error);
@@ -1059,8 +1095,31 @@ app.get('/auth/google/callback', async (req, res) => {
 
 app.get('/auth/user', async (req, res) => {
     try {
+        // Check for JWT token first
+        const token = req.headers.authorization?.split(' ')[1];
+        
+        if (token) {
+            const decoded = verifyJWT(token);
+            if (decoded) {
+                // Get user preferences
+                const preferences = await User.getPreferences(decoded.id);
+                
+                return res.json({
+                    authenticated: true,
+                    user: {
+                        ...decoded,
+                        preferences: preferences || {
+                            preferred_model: 'gpt-4',
+                            enabled_tools: [],
+                            settings: {}
+                        }
+                    }
+                });
+            }
+        }
+
+        // Fallback to session-based auth
         if (req.session.user) {
-            // Get user preferences
             const preferences = await User.getPreferences(req.session.user.id);
 
             res.json({
@@ -1088,12 +1147,21 @@ app.get('/auth/user', async (req, res) => {
         });
     }
 });
-
 app.post('/auth/logout', async (req, res) => {
     try {
-        if (req.session.user) {
+        const token = req.headers.authorization?.split(' ')[1];
+        let userId = null;
+
+        if (token) {
+            const decoded = verifyJWT(token);
+            userId = decoded?.id;
+        } else if (req.session.user) {
+            userId = req.session.user.id;
+        }
+
+        if (userId) {
             // Optionally clean up tokens from database
-            await AuthToken.delete(req.session.user.id);
+            await AuthToken.delete(userId);
         }
 
         req.session.destroy((err) => {
