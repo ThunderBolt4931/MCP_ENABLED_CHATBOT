@@ -45,6 +45,7 @@ SCOPES = [
     'https://www.googleapis.com/auth/gmail.send',
     'https://www.googleapis.com/auth/gmail.labels',
     'https://www.googleapis.com/auth/gmail.modify',
+    'https://www.googleapis.com/auth/gmail.compose',
     "https://www.googleapis.com/auth/calendar.events",
     "https://www.googleapis.com/auth/calendar.readonly",
     'https://www.googleapis.com/auth/documents'
@@ -66,6 +67,7 @@ def load_credentials():
     expires_at = os.getenv("GOOGLE_TOKEN_EXPIRES_AT")
     client_id = os.getenv("GOOGLE_CLIENT_ID")
     client_secret = os.getenv("GOOGLE_CLIENT_SECRET")
+    SESSION_USER_ID=os.getenv("SESSION_USER_ID")
 
     print(f"Environment check:", file=sys.stderr)
     print(f"  - Access token: {'✓' if access_token else '✗'}", file=sys.stderr)
@@ -73,6 +75,7 @@ def load_credentials():
     print(f"  - Client ID: {'✓' if client_id else '✗'}", file=sys.stderr)
     print(f"  - Client secret: {'✓' if client_secret else '✗'}", file=sys.stderr)
     print(f"  - Expires at: {expires_at}", file=sys.stderr)
+    print(f"  - SESSION_USER_ID is: {SESSION_USER_ID}", file=sys.stderr)
     if not all([access_token, refresh_token, client_id, client_secret]):
         print("Missing required OAuth credentials", file=sys.stderr)
         return None
