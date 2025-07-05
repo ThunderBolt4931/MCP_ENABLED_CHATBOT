@@ -1199,7 +1199,7 @@ app.get('/auth/user', async (req, res) => {
                     user: {
                         ...decoded,
                         preferences: preferences || {
-                            preferred_model: 'gpt-4',
+                            preferred_model: 'gpt-4o-mini',
                             enabled_tools: [],
                             settings: {}
                         }
@@ -1217,7 +1217,7 @@ app.get('/auth/user', async (req, res) => {
                 user: {
                     ...req.session.user,
                     preferences: preferences || {
-                        preferred_model: 'gpt-4',
+                        preferred_model: 'gpt-4o-mini',
                         enabled_tools: [],
                         settings: {}
                     }
@@ -1539,7 +1539,7 @@ Always think step-by-step and use multiple tools when needed to fully complete t
 
         // Calculate estimated cost
         const modelPricing = {
-            'gpt-4': { input: 0.03 / 1000, output: 0.06 / 1000 },
+            'gpt-4o-mini': { input: 0.03 / 1000, output: 0.06 / 1000 },
             'gpt-4-turbo': { input: 0.01 / 1000, output: 0.03 / 1000 },
             'gpt-3.5-turbo': { input: 0.001 / 1000, output: 0.002 / 1000 }
         };
