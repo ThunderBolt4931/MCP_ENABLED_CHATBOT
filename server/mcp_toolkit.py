@@ -1096,6 +1096,7 @@ def get_attachment_info(payload):
     
     return attachments
 
+
 @mcp.tool()
 def gmail_find_messages_with_attachments(
     max_results: int, 
@@ -1291,6 +1292,7 @@ def gmail_find_messages_with_attachments(
                             
                             # Handle Google Workspace files
                             if attachment_mime.startswith('application/vnd.google-apps'):
+                                # You need to implement this function
                                 export_mime = get_export_mime_type(attachment_mime)
                                 actual_mime = attachment_mime  # Keep original for comparison
                             else:
@@ -1340,31 +1342,54 @@ def gmail_find_messages_with_attachments(
                 valid_messages.append(message_data)
                 
             except Exception as e:
-                # Skip problematic messages
+                # Skip problematic messages but continue processing
                 continue
         
-        # Return final results
-        return json.dumps({
+        # ALWAYS return a string, never None
+        result = json.dumps({
             'status': 'success',
             'count': len(valid_messages),
             'search_query': search_query,
             'messages': valid_messages
         }, indent=2)
         
+        # Ensure we're returning a string
+        if result is None:
+            result = json.dumps({
+                'status': 'error',
+                'error': 'Function returned None - this should not happen'
+            }, indent=2)
+        
+        return result
+        
     except HttpError as http_err:
-        return json.dumps({
+        error_response = json.dumps({
             'status': 'error',
             'error': f'Gmail API error: {str(http_err)}',
             'error_code': getattr(http_err, 'resp', {}).get('status', 'unknown')
         }, indent=2)
+        return error_response
     
     except Exception as general_err:
-        return json.dumps({
+        error_response = json.dumps({
             'status': 'error',
             'error': f'Unexpected error: {str(general_err)}',
             'error_type': type(general_err).__name__
         }, indent=2)
-        
+        return error_response
+
+
+def get_export_mime_type(google_mime_type):
+    """Helper function to map Google Workspace MIME types to export formats"""
+    export_mapping = {
+        'application/vnd.google-apps.document': 'application/pdf',
+        'application/vnd.google-apps.spreadsheet': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        'application/vnd.google-apps.presentation': 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+        'application/vnd.google-apps.drawing': 'image/png',
+        'application/vnd.google-apps.form': 'application/zip',
+        'application/vnd.google-apps.site': 'text/html'
+    }
+    return export_mapping.get(google_mime_type, 'application/octet-stream')
 @mcp.tool()
 def gmail_read_attachment_content(message_id: str, attachment_id: Optional[str] = None) -> str:
     """
