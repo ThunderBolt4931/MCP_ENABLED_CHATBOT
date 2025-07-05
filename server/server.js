@@ -98,108 +98,168 @@ let mcpReady = false;
 let requestId = 1;
 let availableTools = [];
 let pendingResponses = new Map();
+let currentUserId = null;
+let mcpInitializationPromise = null;
 
 // Initialize MCP Server
 async function initializeMCP(userId) {
     if (!userId) {
         console.error('❌ Cannot start MCP without userId');
-        return;
-    }
-    currentUserId = userId;
-
-    const mcpPath = path.join(__dirname, 'mcp_toolkit.py');
-
-    let tokenData;
-    try {
-        tokenData = await AuthToken.findByUserId(userId);
-        if (!tokenData) throw new Error('No auth token found for user');
-    } catch (err) {
-        console.error('❌ Failed to load token from Supabase:', err.message);
-        return;
+        return false;
     }
 
-    const mcpEnv = {
-        ...process.env,
-        PYTHONUNBUFFERED: '1',
-        GOOGLE_ACCESS_TOKEN: tokenData.access_token,
-        GOOGLE_REFRESH_TOKEN: tokenData.refresh_token,
-        GOOGLE_TOKEN_EXPIRES_AT: new Date(tokenData.expires_at).getTime().toString(),
-        SESSION_USER_ID: userId
-    };
-    console.log('🔐 Starting MCP with tokens:', {
-        access: tokenData.access_token?.substring(0, 5) + '...',
-        refresh: tokenData.refresh_token?.substring(0, 5) + '...',
-        expires: tokenData.expires_at
-    });
-    mcpProcess = spawn('python', [mcpPath], {
-        stdio: ['pipe', 'pipe', 'pipe'],
-        env: mcpEnv
-    });
-    let outputBuffer = '';
+    // If already initializing, wait for it
+    if (mcpInitializationPromise) {
+        return mcpInitializationPromise;
+    }
 
-    mcpProcess.stdout.on('data', (data) => {
-        outputBuffer += data.toString();
-        const lines = outputBuffer.split('\n');
-        outputBuffer = lines.pop() || '';
+    mcpInitializationPromise = new Promise(async (resolve, reject) => {
+        try {
+            currentUserId = userId;
 
-        for (let line of lines) {
-            if (line.trim()) {
-                console.log('MCP Raw Output:', line);
+            // Kill existing process if any
+            if (mcpProcess) {
+                mcpProcess.kill();
+                mcpProcess = null;
+                mcpReady = false;
+            }
 
-                if (line.includes('Server ready') || line.includes('Google Drive service initialized')) {
-                    mcpReady = true;
-                    console.log('✅ MCP Server is ready');
-                    // Get available tools once ready
-                    setTimeout(() => getAvailableTools(), 1000);
-                }
+            // Find Python executable
+            const pythonCmd = process.platform === 'win32' ? 'python' : 'python3';
+            const mcpPath = path.join(__dirname, 'mcp_toolkit.py');
 
-                try {
-                    const response = JSON.parse(line);
-                    console.log('📥 MCP JSON Response:', response);
+            // Verify Python file exists
+            try {
+                await fs.access(mcpPath);
+            } catch (err) {
+                throw new Error(`MCP Python file not found: ${mcpPath}`);
+            }
 
-                    if (response.id && pendingResponses.has(response.id)) {
-                        const { resolve, reject } = pendingResponses.get(response.id);
-                        pendingResponses.delete(response.id);
+            let tokenData;
+            try {
+                tokenData = await AuthToken.findByUserId(userId);
+                if (!tokenData) throw new Error('No auth token found for user');
+            } catch (err) {
+                throw new Error(`Failed to load token from database: ${err.message}`);
+            }
 
-                        if (response.error) {
-                            reject(new Error(response.error.message || JSON.stringify(response.error)));
-                        } else {
-                            resolve(response.result);
+            const mcpEnv = {
+                ...process.env,
+                PYTHONUNBUFFERED: '1',
+                PYTHONIOENCODING: 'utf-8',
+                GOOGLE_ACCESS_TOKEN: tokenData.access_token,
+                GOOGLE_REFRESH_TOKEN: tokenData.refresh_token,
+                GOOGLE_TOKEN_EXPIRES_AT: new Date(tokenData.expires_at).getTime().toString(),
+                GOOGLE_CLIENT_ID: process.env.GOOGLE_CLIENT_ID,
+                GOOGLE_CLIENT_SECRET: process.env.GOOGLE_CLIENT_SECRET,
+                SESSION_USER_ID: userId
+            };
+
+            console.log('🔐 Starting MCP with environment variables set');
+            console.log('🔐 Python command:', pythonCmd);
+            console.log('🔐 MCP path:', mcpPath);
+
+            mcpProcess = spawn(pythonCmd, [mcpPath], {
+                stdio: ['pipe', 'pipe', 'pipe'],
+                env: mcpEnv,
+                cwd: __dirname
+            });
+
+            let outputBuffer = '';
+            let initializationTimeout = setTimeout(() => {
+                reject(new Error('MCP initialization timeout'));
+            }, 30000); // 30 second timeout
+
+            mcpProcess.stdout.on('data', (data) => {
+                outputBuffer += data.toString();
+                const lines = outputBuffer.split('\n');
+                outputBuffer = lines.pop() || '';
+
+                for (let line of lines) {
+                    if (line.trim()) {
+                        console.log('MCP Output:', line);
+
+                        // Check for initialization completion
+                        if (line.includes('Server ready') ||
+                            line.includes('Google Drive service initialized') ||
+                            line.includes('MCP Toolkit started')) {
+                            mcpReady = true;
+                            clearTimeout(initializationTimeout);
+                            console.log('✅ MCP Server is ready');
+
+                            // Initialize handshake
+                            setTimeout(async () => {
+                                try {
+                                    await initializeMCPHandshake();
+                                    resolve(true);
+                                } catch (err) {
+                                    reject(err);
+                                }
+                            }, 1000);
+                        }
+
+                        // Handle JSON responses
+                        try {
+                            const response = JSON.parse(line);
+                            console.log('📥 MCP JSON Response:', response);
+
+                            if (response.id && pendingResponses.has(response.id)) {
+                                const { resolve: resolveReq, reject: rejectReq } = pendingResponses.get(response.id);
+                                pendingResponses.delete(response.id);
+
+                                if (response.error) {
+                                    rejectReq(new Error(response.error.message || JSON.stringify(response.error)));
+                                } else {
+                                    resolveReq(response.result);
+                                }
+                            }
+                        } catch (e) {
+                            // Not JSON, just log
+                            if (!line.includes('WARNING') && !line.includes('oauth2client')) {
+                                console.log('📄 MCP Status:', line);
+                            }
                         }
                     }
-                } catch (e) {
-                    if (!line.includes('WARNING') && !line.includes('oauth2client')) {
-                        console.log('📄 MCP Status:', line);
-                    }
                 }
-            }
+            });
+
+            mcpProcess.stderr.on('data', (data) => {
+                const errorOutput = data.toString();
+                console.error(`[MCP STDERR]: ${errorOutput}`);
+
+                // Check for critical errors
+                if (errorOutput.includes('ModuleNotFoundError') ||
+                    errorOutput.includes('ImportError') ||
+                    errorOutput.includes('SyntaxError')) {
+                    clearTimeout(initializationTimeout);
+                    reject(new Error(`MCP Python error: ${errorOutput}`));
+                }
+            });
+
+            mcpProcess.on('close', (code) => {
+                console.log(`MCP process exited with code ${code}`);
+                mcpProcess = null;
+                mcpReady = false;
+                clearTimeout(initializationTimeout);
+
+                if (code !== 0) {
+                    reject(new Error(`MCP process exited with code ${code}`));
+                }
+            });
+
+            mcpProcess.on('error', (error) => {
+                console.error('❌ MCP process error:', error);
+                clearTimeout(initializationTimeout);
+                reject(error);
+            });
+
+        } catch (error) {
+            console.error('❌ MCP initialization error:', error);
+            reject(error);
         }
     });
-    mcpProcess.stderr.on('data', (data) => {
-        // This will print any and all messages from Python's stderr stream
-        console.error(`[PYTHON STDERR]: ${data.toString()}`);
-    });
-    // --- END OF ADDED BLOCK ---
 
-    // It's also good practice to know if the process closes unexpectedly
-    mcpProcess.on('close', (code) => {
-        console.log(`MCP process exited with code ${code}`);
-        mcpProcess = null; // Clear the process variable
-        mcpReady = false;
-    });
-
-    setTimeout(() => {
-        initializeMCPHandshake();
-    }, 2000);
-}
-function restartMCP() {
-    console.log('♻️ Restarting MCP due to updated credentials...');
-    if (mcpProcess) {
-        mcpProcess.kill();
-    }
-    setTimeout(() => {
-        initializeMCP(user.Id);
-    }, 1000);
+    return mcpInitializationPromise;
 }
 
 async function initializeMCPHandshake() {
@@ -221,14 +281,130 @@ async function initializeMCPHandshake() {
         });
 
         console.log('✅ MCP Initialize response:', initResponse);
+
         await sendMCPNotification('notifications/initialized');
         console.log('✅ MCP Handshake completed');
+
         await getAvailableTools();
+        console.log('✅ Available tools loaded');
 
     } catch (error) {
         console.error('❌ MCP Handshake failed:', error);
+        throw error;
     }
 }
+
+function sendMCPRequest(method, params = {}) {
+    return new Promise((resolve, reject) => {
+        if (!mcpProcess || !mcpProcess.stdin || !mcpReady) {
+            reject(new Error('MCP process not ready'));
+            return;
+        }
+
+        const currentRequestId = requestId++;
+        const request = {
+            jsonrpc: '2.0',
+            id: currentRequestId,
+            method: method,
+            params: params
+        };
+
+        console.log('📤 Sending MCP request:', JSON.stringify(request));
+
+        pendingResponses.set(currentRequestId, { resolve, reject });
+
+        // Timeout handling
+        const timeout = setTimeout(() => {
+            if (pendingResponses.has(currentRequestId)) {
+                pendingResponses.delete(currentRequestId);
+                reject(new Error(`MCP request timeout for method: ${method}`));
+            }
+        }, 30000);
+
+        // Clean up timeout on resolution
+        const originalResolve = resolve;
+        const originalReject = reject;
+
+        resolve = (result) => {
+            clearTimeout(timeout);
+            originalResolve(result);
+        };
+
+        reject = (error) => {
+            clearTimeout(timeout);
+            originalReject(error);
+        };
+
+        try {
+            mcpProcess.stdin.write(JSON.stringify(request) + '\n');
+        } catch (error) {
+            clearTimeout(timeout);
+            pendingResponses.delete(currentRequestId);
+            reject(error);
+        }
+    });
+}
+
+
+function sendMCPNotification(method, params = {}) {
+    return new Promise((resolve, reject) => {
+        if (!mcpProcess || !mcpProcess.stdin) {
+            reject(new Error('MCP process not available'));
+            return;
+        }
+
+        const notification = {
+            jsonrpc: '2.0',
+            method: method,
+            params: params
+        };
+
+        console.log('📤 Sending MCP notification:', JSON.stringify(notification));
+
+        try {
+            mcpProcess.stdin.write(JSON.stringify(notification) + '\n');
+            resolve(true);
+        } catch (error) {
+            reject(error);
+        }
+    });
+}
+
+async function callMCPTool(toolName, params) {
+    try {
+        console.log(`🔧 Calling MCP tool: ${toolName}`, params);
+
+        // Ensure MCP is ready
+        if (!mcpReady || !mcpProcess) {
+            throw new Error('MCP service not ready');
+        }
+
+        const result = await sendMCPRequest('tools/call', {
+            name: toolName,
+            arguments: params
+        });
+
+        console.log(`✅ Tool ${toolName} result:`, result);
+
+        if (result && result.content) {
+            if (Array.isArray(result.content)) {
+                return result.content.map(item => item.text || item).join('\n');
+            } else if (typeof result.content === 'object' && result.content.text) {
+                return result.content.text;
+            } else {
+                return result.content.toString();
+            }
+        } else if (typeof result === 'string') {
+            return result;
+        } else {
+            return JSON.stringify(result);
+        }
+    } catch (error) {
+        console.error(`❌ Error calling tool ${toolName}:`, error);
+        throw error;
+    }
+}
+
 
 // Complete list of ALL MCP tools (30+ tools)
 const getAllMCPTools = () => [
@@ -722,264 +898,158 @@ async function getAvailableTools() {
     }
 }
 
-function sendMCPRequest(method, params = {}) {
-    return new Promise((resolve, reject) => {
-        if (!mcpProcess || !mcpProcess.stdin) {
-            reject(new Error('MCP process not available'));
-            return;
-        }
-
-        const currentRequestId = requestId++;
-        const request = {
-            jsonrpc: '2.0',
-            id: currentRequestId,
-            method: method,
-            params: params
-        };
-
-        console.log('📤 Sending MCP request:', JSON.stringify(request));
-
-        pendingResponses.set(currentRequestId, { resolve, reject });
-
-        setTimeout(() => {
-            if (pendingResponses.has(currentRequestId)) {
-                pendingResponses.delete(currentRequestId);
-                reject(new Error(`MCP request timeout for method: ${method}`));
-            }
-        }, 30000);
-
-        try {
-            mcpProcess.stdin.write(JSON.stringify(request) + '\n');
-        } catch (error) {
-            pendingResponses.delete(currentRequestId);
-            reject(error);
-        }
-    });
-}
-
-function sendMCPNotification(method, params = {}) {
-    return new Promise((resolve, reject) => {
-        if (!mcpProcess || !mcpProcess.stdin) {
-            reject(new Error('MCP process not available'));
-            return;
-        }
-
-        const notification = {
-            jsonrpc: '2.0',
-            method: method,
-            params: params
-        };
-
-        console.log('📤 Sending MCP notification:', JSON.stringify(notification));
-
-        try {
-            mcpProcess.stdin.write(JSON.stringify(notification) + '\n');
-            resolve(true);
-        } catch (error) {
-            reject(error);
-        }
-    });
-}
-
-async function callMCPTool(toolName, params) {
-    try {
-        console.log(`🔧 Calling MCP tool: ${toolName}`, params);
-
-        const result = await sendMCPRequest('tools/call', {
-            name: toolName,
-            arguments: params
-        });
-
-        console.log(`✅ Tool ${toolName} result:`, result);
-
-        if (result && result.content) {
-            if (Array.isArray(result.content)) {
-                return result.content.map(item => item.text || item).join('\n');
-            } else if (typeof result.content === 'object' && result.content.text) {
-                return result.content.text;
-            } else {
-                return result.content.toString();
-            }
-        } else if (typeof result === 'string') {
-            return result;
-        } else {
-            return JSON.stringify(result);
-        }
-    } catch (error) {
-        console.error(`❌ Error calling tool ${toolName}:`, error);
-        throw error;
-    }
-}
 
 // Authentication middleware
 const requireAuth = (req, res, next) => {
-        const token = req.headers.authorization?.split(' ')[1]; // Bearer token
+    const token = req.headers.authorization?.split(' ')[1]; // Bearer token
 
-        if (!token) {
-            return res.status(401).json({ error: 'Authentication required' });
+    if (!token) {
+        return res.status(401).json({ error: 'Authentication required' });
+    }
+
+    const decoded = verifyJWT(token);
+    if (!decoded) {
+        return res.status(401).json({ error: 'Invalid token' });
+    }
+
+    req.user = decoded;
+    next();
+};
+
+// Google OAuth routes
+app.get('/auth/google', (req, res) => {
+    const authUrl = googleClient.generateAuthUrl({
+        access_type: 'offline',
+        scope: [
+            'https://www.googleapis.com/auth/userinfo.profile',
+            'https://www.googleapis.com/auth/userinfo.email',
+            'https://www.googleapis.com/auth/drive',
+            'https://www.googleapis.com/auth/gmail.readonly',
+            'https://www.googleapis.com/auth/gmail.send',
+            'https://www.googleapis.com/auth/gmail.labels',
+            'https://www.googleapis.com/auth/gmail.modify',
+            'https://www.googleapis.com/auth/calendar.events',
+            'https://www.googleapis.com/auth/calendar.readonly',
+            'https://www.googleapis.com/auth/documents',
+            'https://www.googleapis.com/auth/spreadsheets'
+        ],
+        prompt: 'consent'
+    });
+    res.redirect(authUrl);
+});
+
+app.get('/auth/google/callback', async (req, res) => {
+    try {
+        const { code } = req.query;
+
+        if (!code) {
+            console.error('No authorization code received');
+            return res.redirect(`${process.env.FRONTEND_URL}/login?error=no_code`);
         }
 
-        const decoded = verifyJWT(token);
-        if (!decoded) {
-            return res.status(401).json({ error: 'Invalid token' });
-        }
+        console.log('🔐 Processing Google OAuth callback...');
 
-        req.user = decoded;
-        next();
-    };
+        const { tokens } = await googleClient.getToken(code);
+        console.log('✅ Received OAuth tokens');
 
-    // Google OAuth routes
-    app.get('/auth/google', (req, res) => {
-        const authUrl = googleClient.generateAuthUrl({
-            access_type: 'offline',
-            scope: [
-                'https://www.googleapis.com/auth/userinfo.profile',
-                'https://www.googleapis.com/auth/userinfo.email',
-                'https://www.googleapis.com/auth/drive',
-                'https://www.googleapis.com/auth/gmail.readonly',
-                'https://www.googleapis.com/auth/gmail.send',
-                'https://www.googleapis.com/auth/gmail.labels',
-                'https://www.googleapis.com/auth/gmail.modify',
-                'https://www.googleapis.com/auth/calendar.events',
-                'https://www.googleapis.com/auth/calendar.readonly',
-                'https://www.googleapis.com/auth/documents',
-                'https://www.googleapis.com/auth/spreadsheets'
-            ],
-            prompt: 'consent'
+        // Get user info
+        googleClient.setCredentials(tokens);
+        const ticket = await googleClient.verifyIdToken({
+            idToken: tokens.id_token,
+            audience: GOOGLE_CLIENT_ID
         });
-        res.redirect(authUrl);
-    });
 
-    app.get('/auth/google/callback', async (req, res) => {
-        try {
-            const { code } = req.query;
+        const payload = ticket.getPayload();
+        const googleId = payload.sub;
 
-            if (!code) {
-                console.error('No authorization code received');
-                return res.redirect(`${process.env.FRONTEND_URL}/login?error=no_code`);
-            }
+        console.log('👤 User info retrieved:', { email: payload.email, name: payload.name });
 
-            console.log('🔐 Processing Google OAuth callback...');
+        // Find or create user in database
+        let user = await User.findByGoogleId(googleId);
 
-            const { tokens } = await googleClient.getToken(code);
-            console.log('✅ Received OAuth tokens');
-
-            // Get user info
-            googleClient.setCredentials(tokens);
-            const ticket = await googleClient.verifyIdToken({
-                idToken: tokens.id_token,
-                audience: GOOGLE_CLIENT_ID
+        if (!user) {
+            console.log('🆕 Creating new user...');
+            user = await User.create({
+                googleId: googleId,
+                email: payload.email,
+                name: payload.name,
+                picture: payload.picture
             });
-
-            const payload = ticket.getPayload();
-            const googleId = payload.sub;
-
-            console.log('👤 User info retrieved:', { email: payload.email, name: payload.name });
-
-            // Find or create user in database
-            let user = await User.findByGoogleId(googleId);
-
-            if (!user) {
-                console.log('🆕 Creating new user...');
-                user = await User.create({
-                    googleId: googleId,
-                    email: payload.email,
-                    name: payload.name,
-                    picture: payload.picture
-                });
-            } else {
-                console.log('👋 Existing user found, updating info...');
-                user = await User.update(user.id, {
-                    email: payload.email,
-                    name: payload.name,
-                    picture: payload.picture
-                });
-            }
-
-            // Store or update auth tokens
-            const expiresAt = new Date(Date.now() + (tokens.expiry_date || 3600000));
-
-            const existingToken = await AuthToken.findByUserId(user.id);
-            if (existingToken) {
-                await AuthToken.update(user.id, {
-                    access_token: tokens.access_token,
-                    refresh_token: tokens.refresh_token,
-                    id_token: tokens.id_token,
-                    expires_at: expiresAt
-                });
-            } else {
-                await AuthToken.create({
-                    userId: user.id,
-                    accessToken: tokens.access_token,
-                    refreshToken: tokens.refresh_token,
-                    idToken: tokens.id_token,
-                    expiresAt: expiresAt
-                });
-            }
-
-            // Generate JWT token
-            const jwtToken = generateJWT(user);
-
-            // Store user session (fallback for same-domain scenarios)
-            req.session.user = {
-                id: user.id,
-                email: user.email,
-                name: user.name,
-                picture: user.picture
-            };
-
-            console.log('💾 User session created successfully');
-
-            try {
-                await initializeMCP(user.id);
-                console.log("MCP initialized successfully");
-            } catch (error) {
-                console.log("MCP initialization error:", error);
-            }
-
-            // Redirect with JWT token as query parameter
-            console.log('🔄 Redirecting to chat interface with JWT...');
-            res.redirect(`${process.env.FRONTEND_URL}/auth/callback?token=${jwtToken}`);
-
-        } catch (error) {
-            console.error('❌ Google OAuth callback error:', error);
-            res.redirect(`${process.env.FRONTEND_URL}/login?error=auth_failed`);
+        } else {
+            console.log('👋 Existing user found, updating info...');
+            user = await User.update(user.id, {
+                email: payload.email,
+                name: payload.name,
+                picture: payload.picture
+            });
         }
-    });
 
-    app.get('/auth/user', async (req, res) => {
+        // Store or update auth tokens
+        const expiresAt = new Date(Date.now() + (tokens.expiry_date || 3600000));
+
+        const existingToken = await AuthToken.findByUserId(user.id);
+        if (existingToken) {
+            await AuthToken.update(user.id, {
+                access_token: tokens.access_token,
+                refresh_token: tokens.refresh_token,
+                id_token: tokens.id_token,
+                expires_at: expiresAt
+            });
+        } else {
+            await AuthToken.create({
+                userId: user.id,
+                accessToken: tokens.access_token,
+                refreshToken: tokens.refresh_token,
+                idToken: tokens.id_token,
+                expiresAt: expiresAt
+            });
+        }
+
+        // Generate JWT token
+        const jwtToken = generateJWT(user);
+
+        // Store user session (fallback for same-domain scenarios)
+        req.session.user = {
+            id: user.id,
+            email: user.email,
+            name: user.name,
+            picture: user.picture
+        };
+
+        console.log('💾 User session created successfully');
+
         try {
-            // Check for JWT token first
-            const token = req.headers.authorization?.split(' ')[1];
+            await initializeMCP(user.id);
+            console.log("MCP initialized successfully");
+        } catch (error) {
+            console.log("MCP initialization error:", error);
+        }
 
-            if (token) {
-                const decoded = verifyJWT(token);
-                if (decoded) {
-                    // Get user preferences
-                    const preferences = await User.getPreferences(decoded.id);
+        // Redirect with JWT token as query parameter
+        console.log('🔄 Redirecting to chat interface with JWT...');
+        res.redirect(`${process.env.FRONTEND_URL}/auth/callback?token=${jwtToken}`);
 
-                    return res.json({
-                        authenticated: true,
-                        user: {
-                            ...decoded,
-                            preferences: preferences || {
-                                preferred_model: 'gpt-4',
-                                enabled_tools: [],
-                                settings: {}
-                            }
-                        }
-                    });
-                }
-            }
+    } catch (error) {
+        console.error('❌ Google OAuth callback error:', error);
+        res.redirect(`${process.env.FRONTEND_URL}/login?error=auth_failed`);
+    }
+});
 
-            // Fallback to session-based auth
-            if (req.session.user) {
-                const preferences = await User.getPreferences(req.session.user.id);
+app.get('/auth/user', async (req, res) => {
+    try {
+        // Check for JWT token first
+        const token = req.headers.authorization?.split(' ')[1];
 
-                res.json({
+        if (token) {
+            const decoded = verifyJWT(token);
+            if (decoded) {
+                // Get user preferences
+                const preferences = await User.getPreferences(decoded.id);
+
+                return res.json({
                     authenticated: true,
                     user: {
-                        ...req.session.user,
+                        ...decoded,
                         preferences: preferences || {
                             preferred_model: 'gpt-4',
                             enabled_tools: [],
@@ -987,156 +1057,184 @@ const requireAuth = (req, res, next) => {
                         }
                     }
                 });
-            } else {
-                res.json({
-                    authenticated: false,
-                    user: null
-                });
             }
-        } catch (error) {
-            console.error('Error checking auth:', error);
+        }
+
+        // Fallback to session-based auth
+        if (req.session.user) {
+            const preferences = await User.getPreferences(req.session.user.id);
+
+            res.json({
+                authenticated: true,
+                user: {
+                    ...req.session.user,
+                    preferences: preferences || {
+                        preferred_model: 'gpt-4',
+                        enabled_tools: [],
+                        settings: {}
+                    }
+                }
+            });
+        } else {
             res.json({
                 authenticated: false,
                 user: null
             });
         }
-    });
-    app.post('/auth/logout', async (req, res) => {
-        try {
-            const token = req.headers.authorization?.split(' ')[1];
-            let userId = null;
+    } catch (error) {
+        console.error('Error checking auth:', error);
+        res.json({
+            authenticated: false,
+            user: null
+        });
+    }
+});
+app.post('/auth/logout', async (req, res) => {
+    try {
+        const token = req.headers.authorization?.split(' ')[1];
+        let userId = null;
 
-            if (token) {
-                const decoded = verifyJWT(token);
-                userId = decoded?.id;
-            } else if (req.session.user) {
-                userId = req.session.user.id;
-            }
-
-            if (userId) {
-                // Optionally clean up tokens from database
-                await AuthToken.delete(userId);
-            }
-
-            req.session.destroy((err) => {
-                if (err) {
-                    console.error('Session destruction error:', err);
-                    return res.status(500).json({ error: 'Failed to logout' });
-                }
-                res.json({ success: true });
-            });
-        } catch (error) {
-            console.error('Logout error:', error);
-            res.status(500).json({ error: 'Failed to logout' });
+        if (token) {
+            const decoded = verifyJWT(token);
+            userId = decoded?.id;
+        } else if (req.session.user) {
+            userId = req.session.user.id;
         }
-    });
 
-    // Chat endpoint with database integration
-    app.post('/api/chat', requireAuth, upload.array('attachments', 5), async (req, res) => {
+        if (userId) {
+            // Optionally clean up tokens from database
+            await AuthToken.delete(userId);
+        }
+
+        req.session.destroy((err) => {
+            if (err) {
+                console.error('Session destruction error:', err);
+                return res.status(500).json({ error: 'Failed to logout' });
+            }
+            res.json({ success: true });
+        });
+    } catch (error) {
+        console.error('Logout error:', error);
+        res.status(500).json({ error: 'Failed to logout' });
+    }
+});
+
+// Chat endpoint with database integration
+app.post('/api/chat', requireAuth, upload.array('attachments', 5), async (req, res) => {
+    try {
+        const { message, chatId, model = 'gpt-4', enabledTools = '[]' } = req.body;
+        const userId = req.user.id;
+        const files = req.files || [];
+
+        console.log(`📝 Chat request received:`, {
+            userId,
+            message: message ? `${message.substring(0, 100)}...` : 'No message',
+            model,
+            filesCount: files.length,
+            chatId: chatId || 'new'
+        });
+
+        if (!message && files.length === 0) {
+            return res.status(400).json({ error: 'Message or attachments required' });
+        }
+
+        // Ensure MCP is initialized for this user
         try {
-            const { message, chatId, model = 'gpt-4', enabledTools = '[]' } = req.body;
-
-            // Fix: Get userId from req.user (set by requireAuth middleware) instead of req.session.user
-            const userId = req.user.id;
-            const files = req.files || [];
-
-            console.log(`📝 Chat request received:`, {
-                userId,
-                message: message ? `${message.substring(0, 100)}...` : 'No message',
-                model,
-                filesCount: files.length,
-                chatId: chatId || 'new'
-            });
-
-            if (!message && files.length === 0) {
-                return res.status(400).json({ error: 'Message or attachments required' });
+            if (!mcpReady || currentUserId !== userId) {
+                console.log('🔄 Initializing MCP for user:', userId);
+                await initializeMCP(userId);
             }
+        } catch (mcpError) {
+            console.error('❌ MCP initialization failed:', mcpError);
+            // Continue without MCP tools
+            console.log('⚠️ Continuing without MCP tools');
+        }
 
-            // Initialize tools if not already done
-            if (availableTools.length === 0) {
-                console.log('🔧 Initializing tools...');
-                availableTools = getAllMCPTools();
-                console.log(`✅ Initialized ${availableTools.length} tools`);
+        // Initialize tools
+        if (availableTools.length === 0) {
+            console.log('🔧 Loading fallback tools...');
+            availableTools = getAllMCPTools();
+            console.log(`✅ Loaded ${availableTools.length} fallback tools`);
+        }
+
+        let currentChatId = chatId;
+        let chat;
+
+        // Create or get chat
+        if (!currentChatId || currentChatId === 'new') {
+            const title = message ? message.substring(0, 50) + '...' : `File Upload: ${files.map(f => f.originalname).join(', ')}`;
+            console.log(`📁 Creating new chat: ${title}`);
+            chat = await Chat.create(userId, title);
+            currentChatId = chat.id;
+        } else {
+            console.log(`📁 Using existing chat: ${currentChatId}`);
+            chat = await Chat.findById(currentChatId);
+            if (!chat) {
+                return res.status(404).json({ error: 'Chat not found' });
             }
+        }
 
-            let currentChatId = chatId;
-            let chat;
+        // Handle file uploads
+        let fileContents = [];
+        for (const file of files) {
+            try {
+                console.log(`📎 File uploaded: ${file.originalname}`);
 
-            // Create or get chat
-            if (!currentChatId || currentChatId === 'new') {
-                const title = message ? message.substring(0, 50) + '...' : `File Upload: ${files.map(f => f.originalname).join(', ')}`;
-                console.log(`📁 Creating new chat: ${title}`);
-                chat = await Chat.create(userId, title);
-                currentChatId = chat.id;
-            } else {
-                console.log(`📁 Using existing chat: ${currentChatId}`);
-                chat = await Chat.findById(currentChatId);
-                if (!chat) {
-                    return res.status(404).json({ error: 'Chat not found' });
-                }
+                // Upload file to Supabase Storage
+                const uploadResult = await FileUploadService.uploadFile(file, userId);
+                console.log(`☁️ File uploaded to storage: ${uploadResult.storagePath}`);
+
+                // Parse file content
+                const parsedContent = await FileParser.parseFile(
+                    uploadResult.storagePath,
+                    uploadResult.mimeType,
+                    uploadResult.originalName
+                );
+
+                fileContents.push({
+                    filename: uploadResult.originalName,
+                    content: parsedContent,
+                    mimeType: uploadResult.mimeType
+                });
+
+                // Save attachment to database
+                await Attachment.create({
+                    messageId: null,
+                    userId: userId,
+                    filename: uploadResult.filename,
+                    originalName: uploadResult.originalName,
+                    mimeType: uploadResult.mimeType,
+                    fileSize: uploadResult.fileSize,
+                    storagePath: uploadResult.storagePath
+                });
+
+            } catch (fileError) {
+                console.error(`❌ Error processing file ${file.originalname}:`, fileError);
+                fileContents.push({
+                    filename: file.originalname,
+                    content: `Error processing file: ${fileError.message}`,
+                    mimeType: file.mimetype
+                });
             }
+        }
 
-            // Handle file uploads
-            let fileContents = [];
-            for (const file of files) {
-                try {
-                    console.log(`📎 File uploaded: ${file.originalname}`);
+        // Build user message content
+        let userMessageContent = message || '';
+        if (fileContents.length > 0) {
+            const fileDescriptions = fileContents.map(file =>
+                `File: "${file.filename}" (${file.mimeType})\nContent: ${file.content}`
+            ).join('\n\n');
+            userMessageContent = message ? `${message}\n\nUploaded Files:\n${fileDescriptions}` : `Uploaded Files:\n${fileDescriptions}`;
+        }
 
-                    // Upload file to Supabase Storage
-                    const uploadResult = await FileUploadService.uploadFile(file, userId);
-                    console.log(`☁️ File uploaded to storage: ${uploadResult.storagePath}`);
+        // Get chat history for context
+        const chatHistory = await Message.findByChatId(currentChatId);
 
-                    // Parse file content
-                    const parsedContent = await FileParser.parseFile(
-                        uploadResult.storagePath,
-                        uploadResult.mimeType,
-                        uploadResult.originalName
-                    );
-
-                    fileContents.push({
-                        filename: uploadResult.originalName,
-                        content: parsedContent,
-                        mimeType: uploadResult.mimeType
-                    });
-
-                    // Save attachment to database
-                    await Attachment.create({
-                        messageId: null, // Will be updated after message creation
-                        userId: userId,
-                        filename: uploadResult.filename,
-                        originalName: uploadResult.originalName,
-                        mimeType: uploadResult.mimeType,
-                        fileSize: uploadResult.fileSize,
-                        storagePath: uploadResult.storagePath
-                    });
-
-                } catch (fileError) {
-                    console.error(`❌ Error processing file ${file.originalname}:`, fileError);
-                    fileContents.push({
-                        filename: file.originalname,
-                        content: `Error processing file: ${fileError.message}`,
-                        mimeType: file.mimetype
-                    });
-                }
-            }
-
-            // Build user message content
-            let userMessageContent = message || '';
-            if (fileContents.length > 0) {
-                const fileDescriptions = fileContents.map(file =>
-                    `File: "${file.filename}" (${file.mimeType})\nContent: ${file.content}`
-                ).join('\n\n');
-                userMessageContent = message ? `${message}\n\nUploaded Files:\n${fileDescriptions}` : `Uploaded Files:\n${fileDescriptions}`;
-            }
-
-            // Get chat history for context
-            const chatHistory = await Message.findByChatId(currentChatId);
-
-            // Build conversation for OpenAI
-            const messages = [
-                {
-                    role: "system",
-                    content: `You are a helpful AI assistant with access to Google Workspace services through specialized tools. You can:
+        // Build conversation for OpenAI
+        const messages = [
+            {
+                role: "system",
+                content: `You are a helpful AI assistant with access to Google Workspace services through specialized tools. You can:
 
 🔍 **Google Drive**: Search files, read documents, create documents, move files, share files
 📧 **Gmail**: List emails, read messages, send emails, send with Drive attachments
@@ -1148,6 +1246,7 @@ const requireAuth = (req, res, next) => {
 - Break down complex requests into multiple tool calls
 - Always explain what you're doing step by step
 - If a tool call fails, try an alternative approach
+- MCP Status: ${mcpReady ? 'Ready' : 'Not Ready'}
 
 **Multi-step Example Workflows:**
 - Create document → Share with user → Send email with link
@@ -1158,430 +1257,389 @@ const requireAuth = (req, res, next) => {
 ${availableTools.map(tool => `- ${tool.function.name}: ${tool.function.description}`).join('\n')}
 
 Always think step-by-step and use multiple tools when needed to fully complete the user's request.`
-                }
-            ];
-
-            // Add chat history (excluding current message)
-            chatHistory.slice(0, -1).forEach(msg => {
-                messages.push({
-                    role: msg.role,
-                    content: msg.content
-                });
-            });
-
-            // Save user message
-            const userMessage = await Message.create({
-                chatId: currentChatId,
-                userId: userId,
-                role: 'user',
-                content: userMessageContent,
-                model: model,
-                toolsUsed: [],
-                attachments: files.map(file => ({
-                    filename: file.originalname,
-                    original_name: file.originalname,
-                    mime_type: file.mimetype,
-                    file_size: file.size
-                }))
-            });
-
-            messages.push(userMessage);
-            console.log(`💬 Processing chat for user ${userId}, chat ${currentChatId}`);
-            console.log(`🛠️  Available tools: ${availableTools.length}`);
-
-            // Parse enabled tools
-            let parsedEnabledTools = [];
-            try {
-                parsedEnabledTools = JSON.parse(enabledTools);
-            } catch (e) {
-                console.warn('Failed to parse enabled tools:', e);
             }
+        ];
 
-            // Filter available tools based on enabled tools from user preferences
-            const filteredTools = parsedEnabledTools.length > 0
+        // Add chat history (excluding current message)
+        chatHistory.slice(0, -1).forEach(msg => {
+            messages.push({
+                role: msg.role,
+                content: msg.content
+            });
+        });
+
+        // Save user message
+        const userMessage = await Message.create({
+            chatId: currentChatId,
+            userId: userId,
+            role: 'user',
+            content: userMessageContent,
+            model: model,
+            toolsUsed: [],
+            attachments: files.map(file => ({
+                filename: file.originalname,
+                original_name: file.originalname,
+                mime_type: file.mimetype,
+                file_size: file.size
+            }))
+        });
+
+        messages.push(userMessage);
+        console.log(`💬 Processing chat for user ${userId}, chat ${currentChatId}`);
+        console.log(`🛠️  Available tools: ${availableTools.length}`);
+        console.log(`🔧 MCP Ready: ${mcpReady}`);
+
+        // Parse enabled tools
+        let parsedEnabledTools = [];
+        try {
+            parsedEnabledTools = JSON.parse(enabledTools);
+        } catch (e) {
+            console.warn('Failed to parse enabled tools:', e);
+        }
+
+        // Filter available tools based on enabled tools and MCP status
+        let filteredTools = [];
+        if (mcpReady && availableTools.length > 0) {
+            filteredTools = parsedEnabledTools.length > 0
                 ? availableTools.filter(tool => parsedEnabledTools.includes(tool.function.name))
                 : availableTools;
+        }
 
-            console.log(`🛠️ Using ${filteredTools.length} tools for model ${model}:`, filteredTools.map(t => t.function.name));
+        console.log(`🛠️ Using ${filteredTools.length} tools for model ${model}:`, filteredTools.map(t => t.function.name));
 
-            // Initialize token tracking
-            let totalInputTokens = 0;
-            let totalOutputTokens = 0;
-            let totalCost = 0;
+        // Initialize token tracking
+        let totalInputTokens = 0;
+        let totalOutputTokens = 0;
+        let totalCost = 0;
 
-            // Call OpenAI
-            const completion = await openai.chat.completions.create({
+        // Call OpenAI
+        const completion = await openai.chat.completions.create({
+            model: model,
+            messages: messages,
+            tools: filteredTools.length > 0 ? filteredTools : undefined,
+            tool_choice: filteredTools.length > 0 ? "auto" : undefined,
+            temperature: 0.7,
+            max_tokens: 3000
+        });
+
+        // Track tokens from initial completion
+        if (completion.usage) {
+            totalInputTokens += completion.usage.prompt_tokens || 0;
+            totalOutputTokens += completion.usage.completion_tokens || 0;
+            console.log(`📊 Initial API Call - Input tokens: ${completion.usage.prompt_tokens}, Output tokens: ${completion.usage.completion_tokens}`);
+        }
+
+        let response = completion.choices[0].message;
+        let finalResponse = response.content;
+        let toolsUsed = [];
+
+        // Handle function calls (only if MCP is ready)
+        if (response.tool_calls && response.tool_calls.length > 0 && mcpReady) {
+            console.log(`🔧 Processing ${response.tool_calls.length} tool calls`);
+            messages.push(response);
+
+            for (const toolCall of response.tool_calls) {
+                try {
+                    const toolName = toolCall.function.name;
+                    const toolArgs = JSON.parse(toolCall.function.arguments);
+
+                    console.log(`🔧 Executing tool: ${toolName}`, toolArgs);
+
+                    const result = await callMCPTool(toolName, toolArgs);
+                    toolsUsed.push(toolName);
+
+                    messages.push({
+                        role: "tool",
+                        tool_call_id: toolCall.id,
+                        name: toolName,
+                        content: result
+                    });
+
+                    console.log(`✅ Tool ${toolName} completed successfully`);
+                } catch (error) {
+                    console.error(`❌ Tool ${toolCall.function.name} failed:`, error);
+                    messages.push({
+                        role: "tool",
+                        tool_call_id: toolCall.id,
+                        name: toolCall.function.name,
+                        content: `Error executing ${toolCall.function.name}: ${error.message}`
+                    });
+                }
+            }
+
+            // Get final response after tool calls
+            const finalCompletion = await openai.chat.completions.create({
                 model: model,
                 messages: messages,
-                tools: filteredTools,
-                tool_choice: "auto",
+                tools: filteredTools.length > 0 ? filteredTools : undefined,
+                tool_choice: filteredTools.length > 0 ? "auto" : undefined,
                 temperature: 0.7,
                 max_tokens: 3000
             });
 
-            // Track tokens from initial completion
-            if (completion.usage) {
-                totalInputTokens += completion.usage.prompt_tokens || 0;
-                totalOutputTokens += completion.usage.completion_tokens || 0;
-
-                console.log(`📊 Initial API Call - Input tokens: ${completion.usage.prompt_tokens}, Output tokens: ${completion.usage.completion_tokens}`);
+            if (finalCompletion.usage) {
+                totalInputTokens += finalCompletion.usage.prompt_tokens || 0;
+                totalOutputTokens += finalCompletion.usage.completion_tokens || 0;
+                console.log(`📊 Final API Call - Input tokens: ${finalCompletion.usage.prompt_tokens}, Output tokens: ${finalCompletion.usage.completion_tokens}`);
             }
 
-            let response = completion.choices[0].message;
-            let finalResponse = response.content;
-            let toolsUsed = [];
-
-            // Handle function calls
-            if (response.tool_calls && response.tool_calls.length > 0) {
-                console.log(`🔧 Processing ${response.tool_calls.length} tool calls`);
-
-                messages.push(response);
-
-                for (const toolCall of response.tool_calls) {
-                    try {
-                        const toolName = toolCall.function.name;
-                        const toolArgs = JSON.parse(toolCall.function.arguments);
-
-                        console.log(`🔧 Executing tool: ${toolName}`, toolArgs);
-
-                        const result = await callMCPTool(toolName, toolArgs);
-                        toolsUsed.push(toolName);
-
-                        messages.push({
-                            role: "tool",
-                            tool_call_id: toolCall.id,
-                            name: toolName,
-                            content: result
-                        });
-
-                        console.log(`✅ Tool ${toolName} completed successfully`);
-                    } catch (error) {
-                        console.error(`❌ Tool ${toolCall.function.name} failed:`, error);
-                        messages.push({
-                            role: "tool",
-                            tool_call_id: toolCall.id,
-                            name: toolCall.function.name,
-                            content: `Error executing ${toolCall.function.name}: ${error.message}`
-                        });
-                    }
-                }
-
-                // Get final response
-                const finalCompletion = await openai.chat.completions.create({
-                    model: model,
-                    messages: messages,
-                    tools: filteredTools,
-                    tool_choice: "auto",
-                    temperature: 0.7,
-                    max_tokens: 3000
-                });
-
-                let currentResponse = finalCompletion.choices[0].message;
-                let maxIterations = 5; // Prevent infinite loops
-                let iterations = 0;
-
-                while (currentResponse.tool_calls && currentResponse.tool_calls.length > 0 && iterations < maxIterations) {
-                    iterations++;
-                    console.log(`🔧 Processing additional tool calls (iteration ${iterations})`);
-
-                    messages.push(currentResponse);
-
-                    for (const toolCall of currentResponse.tool_calls) {
-                        try {
-                            const toolName = toolCall.function.name;
-                            const toolArgs = JSON.parse(toolCall.function.arguments);
-
-                            const result = await callMCPTool(toolName, toolArgs);
-
-                            messages.push({
-                                role: "tool",
-                                tool_call_id: toolCall.id,
-                                name: toolName,
-                                content: result
-                            });
-                        } catch (error) {
-                            messages.push({
-                                role: "tool",
-                                tool_call_id: toolCall.id,
-                                name: toolCall.function.name,
-                                content: `Error: ${error.message}`
-                            });
-                        }
-                    }
-
-                    const nextCompletion = await openai.chat.completions.create({
-                        model: model,
-                        messages: messages,
-                        tools: filteredTools,
-                        tool_choice: "auto",
-                        temperature: 0.7,
-                        max_tokens: 3000
-                    });
-
-                    currentResponse = nextCompletion.choices[0].message;
-                }
-
-                if (finalCompletion.usage) {
-                    totalInputTokens += finalCompletion.usage.prompt_tokens || 0;
-                    totalOutputTokens += finalCompletion.usage.completion_tokens || 0;
-
-                    console.log(`📊 Final API Call - Input tokens: ${finalCompletion.usage.prompt_tokens}, Output tokens: ${finalCompletion.usage.completion_tokens}`);
-                }
-
-                finalResponse = currentResponse.content;
-            }
-
-            // Calculate estimated cost
-            const modelPricing = {
-                'gpt-4': { input: 0.03 / 1000, output: 0.06 / 1000 },
-                'gpt-4-turbo': { input: 0.01 / 1000, output: 0.03 / 1000 },
-                'gpt-3.5-turbo': { input: 0.001 / 1000, output: 0.002 / 1000 }
-            };
-
-            if (modelPricing[model]) {
-                const pricing = modelPricing[model];
-                totalCost = (totalInputTokens * pricing.input) + (totalOutputTokens * pricing.output);
-            }
-
-            // Print comprehensive token usage
-            console.log(`📊 ===== TOKEN USAGE SUMMARY =====`);
-            console.log(`🔤 Model: ${model}`);
-            console.log(`📥 Total Input Tokens: ${totalInputTokens}`);
-            console.log(`📤 Total Output Tokens: ${totalOutputTokens}`);
-            console.log(`🔢 Total Tokens: ${totalInputTokens + totalOutputTokens}`);
-            if (totalCost > 0) {
-                console.log(`💰 Estimated Cost: $${totalCost.toFixed(6)}`);
-            }
-            console.log(`🛠️ Tools Used: ${toolsUsed.join(', ') || 'None'}`);
-            console.log(`⏰ Timestamp: ${new Date().toISOString()}`);
-            console.log(`================================`);
-
-            // Save assistant message
-            await Message.create({
-                chatId: currentChatId,
-                userId: userId,
-                role: 'assistant',
-                content: finalResponse,
-                model: model,
-                toolsUsed: toolsUsed
-            });
-
-            // Update chat timestamp
-            await Chat.update(currentChatId, {});
-
-            console.log('✅ Chat response generated successfully');
-
-            res.json({
-                response: finalResponse,
-                chatId: currentChatId,
-                model: model,
-                timestamp: new Date().toISOString(),
-                toolsUsed: toolsUsed,
-                mcpReady: mcpReady,
-                tokenUsage: {
-                    inputTokens: totalInputTokens,
-                    outputTokens: totalOutputTokens,
-                    totalTokens: totalInputTokens + totalOutputTokens,
-                    estimatedCost: totalCost > 0 ? totalCost : null
-                }
-            });
-
-        } catch (error) {
-            console.error('❌ Chat error:', error);
-            res.status(500).json({
-                error: 'Failed to process chat message',
-                details: error.message,
-                mcpReady: mcpReady
-            });
-        }
-    });
-    // Get chat history
-    app.get('/api/chat/:chatId', requireAuth, async (req, res) => {
-        try {
-            const { chatId } = req.params;
-            const userId = req.user.id; // Fixed: use req.user instead of req.session.user
-
-            const chat = await Chat.getWithMessages(chatId, userId);
-
-            if (!chat) {
-                return res.status(404).json({ error: 'Chat not found' });
-            }
-
-            res.json(chat);
-        } catch (error) {
-            console.error('Error loading chat:', error);
-            res.status(500).json({ error: 'Failed to load chat' });
-        }
-    });
-    // Get user chats
-    app.get('/api/chats/:userId', requireAuth, async (req, res) => {
-        try {
-            const { userId } = req.params;
-
-            if (userId !== req.user.id) { // Fixed: use req.user instead of req.session.user
-                return res.status(403).json({ error: 'Access denied' });
-            }
-
-            const chats = await Chat.findByUserId(userId);
-            res.json({ chats });
-        } catch (error) {
-            console.error('Error getting chats:', error);
-            res.status(500).json({ error: 'Failed to get chats' });
-        }
-    });
-
-    // Delete chat
-    app.delete('/api/chat/:chatId', requireAuth, async (req, res) => {
-        try {
-            const { chatId } = req.params;
-            const userId = req.user.id; // Fixed: use req.user instead of req.session.user
-
-            // Verify chat belongs to user
-            const chat = await Chat.findById(chatId);
-            if (!chat || chat.user_id !== userId) {
-                return res.status(404).json({ error: 'Chat not found' });
-            }
-
-            await Chat.delete(chatId);
-            res.json({ success: true });
-        } catch (error) {
-            console.error('Error deleting chat:', error);
-            res.status(500).json({ error: 'Failed to delete chat' });
-        }
-    });
-
-    // Tools API
-    app.get('/api/tools', (req, res) => {
-        // Ensure tools are initialized
-        if (availableTools.length === 0) {
-            availableTools = getAllMCPTools();
+            finalResponse = finalCompletion.choices[0].message.content;
+        } else if (response.tool_calls && response.tool_calls.length > 0 && !mcpReady) {
+            // If tools were called but MCP is not ready
+            finalResponse = "I notice you're trying to use Google Workspace tools, but the MCP service is not currently available. Please try again in a moment, or ask me something else I can help with.";
         }
 
-        res.json({
-            tools: availableTools,
-            mcpReady: mcpReady,
-            totalTools: availableTools.length
+        // Calculate estimated cost
+        const modelPricing = {
+            'gpt-4': { input: 0.03 / 1000, output: 0.06 / 1000 },
+            'gpt-4-turbo': { input: 0.01 / 1000, output: 0.03 / 1000 },
+            'gpt-3.5-turbo': { input: 0.001 / 1000, output: 0.002 / 1000 }
+        };
+
+        if (modelPricing[model]) {
+            const pricing = modelPricing[model];
+            totalCost = (totalInputTokens * pricing.input) + (totalOutputTokens * pricing.output);
+        }
+
+        // Print comprehensive token usage
+        console.log(`📊 ===== TOKEN USAGE SUMMARY =====`);
+        console.log(`🔤 Model: ${model}`);
+        console.log(`📥 Total Input Tokens: ${totalInputTokens}`);
+        console.log(`📤 Total Output Tokens: ${totalOutputTokens}`);
+        console.log(`🔢 Total Tokens: ${totalInputTokens + totalOutputTokens}`);
+        if (totalCost > 0) {
+            console.log(`💰 Estimated Cost: $${totalCost.toFixed(6)}`);
+        }
+        console.log(`🛠️ Tools Used: ${toolsUsed.join(', ') || 'None'}`);
+        console.log(`🔧 MCP Status: ${mcpReady ? 'Ready' : 'Not Ready'}`);
+        console.log(`⏰ Timestamp: ${new Date().toISOString()}`);
+        console.log(`================================`);
+
+        // Save assistant message
+        await Message.create({
+            chatId: currentChatId,
+            userId: userId,
+            role: 'assistant',
+            content: finalResponse,
+            model: model,
+            toolsUsed: toolsUsed
         });
-    });
 
-    // MCP Status and Control
-    app.get('/api/mcp/status', (req, res) => {
-        res.json({
-            mcpReady: mcpReady,
-            processRunning: mcpProcess !== null,
-            availableTools: availableTools.length,
-            tools: availableTools.map(t => t.function.name),
-            timestamp: new Date().toISOString()
-        });
-    });
+        // Update chat timestamp
+        await Chat.update(currentChatId, {});
 
-    app.post('/api/mcp/restart', requireAuth, (req, res) => {
-        console.log('🔄 Manual MCP restart requested');
-        restartMCP();
-        res.json({ success: true, message: 'MCP restart initiated' });
-    });
-
-    // User preferences
-    app.get('/api/user/preferences', requireAuth, async (req, res) => {
-        try {
-            const preferences = await User.getPreferences(req.user.id); // Fixed: use req.user instead of req.session.user
-            res.json(preferences || {
-                preferred_model: 'gpt-4',
-                enabled_tools: [],
-                settings: {}
-            });
-        } catch (error) {
-            console.error('Error getting preferences:', error);
-            res.status(500).json({ error: 'Failed to get preferences' });
-        }
-    });
-
-    app.put('/api/user/preferences', requireAuth, async (req, res) => {
-        try {
-            const preferences = await User.updatePreferences(req.user.id, req.body); // Fixed: use req.user instead of req.session.user
-            res.json(preferences);
-        } catch (error) {
-            console.error('Error updating preferences:', error);
-            res.status(500).json({ error: 'Failed to update preferences' });
-        }
-    });
-
-    // Health check
-    app.get('/api/health', (req, res) => {
-        // Ensure tools are initialized
-        if (availableTools.length === 0) {
-            availableTools = getAllMCPTools();
-        }
+        console.log('✅ Chat response generated successfully');
 
         res.json({
-            status: 'ok',
-            mcpReady: mcpReady,
-            availableTools: availableTools.length,
-            tools: availableTools.map(t => t.function.name),
+            response: finalResponse,
+            chatId: currentChatId,
+            model: model,
             timestamp: new Date().toISOString(),
-            toolCategories: {
-                'Google Drive': availableTools.filter(t => t.function.name.startsWith('drive_')).length,
-                'Gmail': availableTools.filter(t => t.function.name.startsWith('gmail_')).length,
-                'Calendar': availableTools.filter(t => t.function.name.startsWith('calendar_')).length,
-                'Google Docs': availableTools.filter(t => t.function.name.startsWith('docs_')).length,
-                'Google Sheets': availableTools.filter(t => t.function.name.startsWith('sheets_')).length,
-                'File Analysis': availableTools.filter(t => ['analyze_file', 'extract_text_from_pdf', 'extract_text_from_docx', 'analyze_image', 'extract_data_from_csv', 'convert_file_format'].includes(t.function.name)).length
+            toolsUsed: toolsUsed,
+            mcpReady: mcpReady,
+            tokenUsage: {
+                inputTokens: totalInputTokens,
+                outputTokens: totalOutputTokens,
+                totalTokens: totalInputTokens + totalOutputTokens,
+                estimatedCost: totalCost > 0 ? totalCost : null
             }
         });
-    });
+    } catch (error) {
+        console.error('❌ Chat error:', error);
+        res.status(500).json({
+            error: 'Failed to process chat message',
+            details: error.message,
+            mcpReady: mcpReady
+        });
+    }
+});
+// Get chat history
+app.get('/api/chat/:chatId', requireAuth, async (req, res) => {
+    try {
+        const { chatId } = req.params;
+        const userId = req.user.id; // Fixed: use req.user instead of req.session.user
 
-    // File download endpoint
-    app.get('/api/attachments/:attachmentId/download', requireAuth, async (req, res) => {
-        try {
-            const { attachmentId } = req.params;
-            const attachment = await Attachment.findById(attachmentId);
+        const chat = await Chat.getWithMessages(chatId, userId);
 
-            if (!attachment) {
-                return res.status(404).json({ error: 'Attachment not found' });
-            }
-
-            // Check if user has access to this attachment
-            if (attachment.user_id !== req.user.id) { // Fixed: use req.user instead of req.session.user
-                return res.status(403).json({ error: 'Access denied' });
-            }
-
-            // Get signed URL from Supabase
-            const signedUrl = await Attachment.getSignedUrl(attachment.storage_path);
-            res.redirect(signedUrl);
-        } catch (error) {
-            console.error('Error downloading attachment:', error);
-            res.status(500).json({ error: 'Failed to download attachment' });
+        if (!chat) {
+            return res.status(404).json({ error: 'Chat not found' });
         }
-    });
 
+        res.json(chat);
+    } catch (error) {
+        console.error('Error loading chat:', error);
+        res.status(500).json({ error: 'Failed to load chat' });
+    }
+});
+// Get user chats
+app.get('/api/chats/:userId', requireAuth, async (req, res) => {
+    try {
+        const { userId } = req.params;
 
-    // Error handling middleware
-    app.use((error, req, res, next) => {
-        console.error('Server error:', error);
-        res.status(500).json({ error: 'Internal server error' });
-    });
+        if (userId !== req.user.id) { // Fixed: use req.user instead of req.session.user
+            return res.status(403).json({ error: 'Access denied' });
+        }
 
-    // Start server
-    app.listen(PORT, async () => {
-        console.log(`🚀 Server running on port ${PORT}`);
-        console.log(`🌐 Environment: ${process.env.NODE_ENV || 'development'}`);
-        console.log(`🔗 Frontend URL: ${process.env.FRONTEND_URL}`);
-        console.log(`🔐 Google OAuth configured: ${!!GOOGLE_CLIENT_ID}`);
+        const chats = await Chat.findByUserId(userId);
+        res.json({ chats });
+    } catch (error) {
+        console.error('Error getting chats:', error);
+        res.status(500).json({ error: 'Failed to get chats' });
+    }
+});
 
-        // Initialize tools immediately
+// Delete chat
+app.delete('/api/chat/:chatId', requireAuth, async (req, res) => {
+    try {
+        const { chatId } = req.params;
+        const userId = req.user.id; // Fixed: use req.user instead of req.session.user
+
+        // Verify chat belongs to user
+        const chat = await Chat.findById(chatId);
+        if (!chat || chat.user_id !== userId) {
+            return res.status(404).json({ error: 'Chat not found' });
+        }
+
+        await Chat.delete(chatId);
+        res.json({ success: true });
+    } catch (error) {
+        console.error('Error deleting chat:', error);
+        res.status(500).json({ error: 'Failed to delete chat' });
+    }
+});
+
+// Tools API
+app.get('/api/tools', (req, res) => {
+    // Ensure tools are initialized
+    if (availableTools.length === 0) {
         availableTools = getAllMCPTools();
-        console.log(`✅ Initialized ${availableTools.length} MCP tools`);
+    }
 
-        // Initialize MCP server
-        console.log('🟡 Skipping MCP startup — will initialize after user login');
+    res.json({
+        tools: availableTools,
+        mcpReady: mcpReady,
+        totalTools: availableTools.length
     });
+});
 
+// MCP Status and Control
+app.get('/api/mcp/status', (req, res) => {
+    res.json({
+        mcpReady: mcpReady,
+        processRunning: mcpProcess !== null,
+        availableTools: availableTools.length,
+        tools: availableTools.map(t => t.function.name),
+        timestamp: new Date().toISOString()
+    });
+});
 
-    // Graceful shutdown
-    process.on('SIGINT', () => {
-        console.log('🛑 Shutting down server...');
-        if (mcpProcess) {
-            mcpProcess.kill();
+app.post('/api/mcp/restart', requireAuth, (req, res) => {
+    console.log('🔄 Manual MCP restart requested');
+    restartMCP();
+    res.json({ success: true, message: 'MCP restart initiated' });
+});
+
+// User preferences
+app.get('/api/user/preferences', requireAuth, async (req, res) => {
+    try {
+        const preferences = await User.getPreferences(req.user.id); // Fixed: use req.user instead of req.session.user
+        res.json(preferences || {
+            preferred_model: 'gpt-4',
+            enabled_tools: [],
+            settings: {}
+        });
+    } catch (error) {
+        console.error('Error getting preferences:', error);
+        res.status(500).json({ error: 'Failed to get preferences' });
+    }
+});
+
+app.put('/api/user/preferences', requireAuth, async (req, res) => {
+    try {
+        const preferences = await User.updatePreferences(req.user.id, req.body); // Fixed: use req.user instead of req.session.user
+        res.json(preferences);
+    } catch (error) {
+        console.error('Error updating preferences:', error);
+        res.status(500).json({ error: 'Failed to update preferences' });
+    }
+});
+
+// Health check
+app.get('/api/health', (req, res) => {
+    // Ensure tools are initialized
+    if (availableTools.length === 0) {
+        availableTools = getAllMCPTools();
+    }
+
+    res.json({
+        status: 'ok',
+        mcpReady: mcpReady,
+        availableTools: availableTools.length,
+        tools: availableTools.map(t => t.function.name),
+        timestamp: new Date().toISOString(),
+        toolCategories: {
+            'Google Drive': availableTools.filter(t => t.function.name.startsWith('drive_')).length,
+            'Gmail': availableTools.filter(t => t.function.name.startsWith('gmail_')).length,
+            'Calendar': availableTools.filter(t => t.function.name.startsWith('calendar_')).length,
+            'Google Docs': availableTools.filter(t => t.function.name.startsWith('docs_')).length,
+            'Google Sheets': availableTools.filter(t => t.function.name.startsWith('sheets_')).length,
+            'File Analysis': availableTools.filter(t => ['analyze_file', 'extract_text_from_pdf', 'extract_text_from_docx', 'analyze_image', 'extract_data_from_csv', 'convert_file_format'].includes(t.function.name)).length
         }
-        process.exit(0);
     });
+});
+
+// File download endpoint
+app.get('/api/attachments/:attachmentId/download', requireAuth, async (req, res) => {
+    try {
+        const { attachmentId } = req.params;
+        const attachment = await Attachment.findById(attachmentId);
+
+        if (!attachment) {
+            return res.status(404).json({ error: 'Attachment not found' });
+        }
+
+        // Check if user has access to this attachment
+        if (attachment.user_id !== req.user.id) { // Fixed: use req.user instead of req.session.user
+            return res.status(403).json({ error: 'Access denied' });
+        }
+
+        // Get signed URL from Supabase
+        const signedUrl = await Attachment.getSignedUrl(attachment.storage_path);
+        res.redirect(signedUrl);
+    } catch (error) {
+        console.error('Error downloading attachment:', error);
+        res.status(500).json({ error: 'Failed to download attachment' });
+    }
+});
+
+
+// Error handling middleware
+app.use((error, req, res, next) => {
+    console.error('Server error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+});
+
+// Start server
+app.listen(PORT, async () => {
+    console.log(`🚀 Server running on port ${PORT}`);
+    console.log(`🌐 Environment: ${process.env.NODE_ENV || 'development'}`);
+    console.log(`🔗 Frontend URL: ${process.env.FRONTEND_URL}`);
+    console.log(`🔐 Google OAuth configured: ${!!GOOGLE_CLIENT_ID}`);
+
+    // Initialize tools immediately
+    availableTools = getAllMCPTools();
+    console.log(`✅ Initialized ${availableTools.length} MCP tools`);
+
+    // Initialize MCP server
+    console.log('🟡 Skipping MCP startup — will initialize after user login');
+});
+
+
+// Graceful shutdown
+process.on('SIGINT', () => {
+    console.log('🛑 Shutting down server...');
+    if (mcpProcess) {
+        mcpProcess.kill();
+    }
+    process.exit(0);
+});
