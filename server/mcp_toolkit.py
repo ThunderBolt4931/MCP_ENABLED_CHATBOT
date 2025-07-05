@@ -67,7 +67,7 @@ def load_credentials():
     expires_at = os.getenv("GOOGLE_TOKEN_EXPIRES_AT")
     client_id = os.getenv("GOOGLE_CLIENT_ID")
     client_secret = os.getenv("GOOGLE_CLIENT_SECRET")
-    SESSION_USER_ID=os.getenv("SESSION_USER_ID")
+    user_id = os.getenv("SESSION_USER_ID")
 
     print(f"Environment check:", file=sys.stderr)
     print(f"  - Access token: {'✓' if access_token else '✗'}", file=sys.stderr)
@@ -75,7 +75,7 @@ def load_credentials():
     print(f"  - Client ID: {'✓' if client_id else '✗'}", file=sys.stderr)
     print(f"  - Client secret: {'✓' if client_secret else '✗'}", file=sys.stderr)
     print(f"  - Expires at: {expires_at}", file=sys.stderr)
-    print(f"  - SESSION_USER_ID is: {SESSION_USER_ID}", file=sys.stderr)
+    print(f"  - User ID: {'✓' if user_id else '✗'}", file=sys.stderr)
     if not all([access_token, refresh_token, client_id, client_secret]):
         print("Missing required OAuth credentials", file=sys.stderr)
         return None
@@ -91,19 +91,29 @@ def load_credentials():
 
         # Manually set expiration if available
         if expires_at:
-            creds.expiry = datetime.utcfromtimestamp(int(expires_at) / 1000)
-
-        if creds.expired and creds.refresh_token:
-            print("Token expired, refreshing...", file=sys.stderr)
             try:
-                creds.refresh(Request())
-                print("Token refreshed successfully", file=sys.stderr)
-            except Exception as e:
-                print(f"Token refresh failed: {e}", file=sys.stderr)
+                creds.expiry = datetime.utcfromtimestamp(int(expires_at) / 1000)
+            except (ValueError, TypeError):
+                print("Invalid expires_at format, setting as expired", file=sys.stderr)
+                creds.expiry = datetime.utcnow() - timedelta(seconds=1)
+
+        if creds.expired or not creds.valid:
+            if creds.refresh_token:
+                print("Token expired or invalid, refreshing...", file=sys.stderr)
+                try:
+                    creds.refresh(Request())
+                    print("Token refreshed successfully", file=sys.stderr)
+                    
+                    # TODO: Save new tokens back to database
+                    # You need to implement this function to update your database
+                    save_refreshed_tokens(user_id, creds)
+                    
+                except Exception as e:
+                    print(f"Token refresh failed: {e}", file=sys.stderr)
+                    return None
+            else:
+                print("Token expired and no refresh token available", file=sys.stderr)
                 return None
-        elif creds.expired:
-            print("Token expired and no refresh token available", file=sys.stderr)
-            return None
 
         return creds
     except Exception as e:
