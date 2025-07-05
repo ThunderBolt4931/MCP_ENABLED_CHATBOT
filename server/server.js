@@ -166,6 +166,7 @@ async function initializeMCP(userId) {
             });
 
             let outputBuffer = '';
+            let errorBuffer = '';
             let allOutput = ''; // Track all output for final check
             let servicesInitialized = {
                 drive: false,
@@ -175,13 +176,58 @@ async function initializeMCP(userId) {
                 serverReady: false
             };
 
+            // Function to check service initialization status
+            const checkServiceStatus = (text) => {
+                // Track service initialization
+                if (text.includes('Google Drive service initialized')) {
+                    servicesInitialized.drive = true;
+                    console.log('✅ Drive service detected');
+                }
+                if (text.includes('Gmail service initialized')) {
+                    servicesInitialized.gmail = true;
+                    console.log('✅ Gmail service detected');
+                }
+                if (text.includes('Google Calendar service initialized')) {
+                    servicesInitialized.calendar = true;
+                    console.log('✅ Calendar service detected');
+                }
+                if (text.includes('Google Docs service initialized')) {
+                    servicesInitialized.docs = true;
+                    console.log('✅ Docs service detected');
+                }
+                if (text.includes('Server ready with Google Drive') || 
+                    text.includes('Waiting for initialization command')) {
+                    servicesInitialized.serverReady = true;
+                    console.log('✅ Server ready status detected');
+                }
+
+                // Check if we can proceed with initialization
+                if (servicesInitialized.drive && servicesInitialized.calendar && 
+                    servicesInitialized.docs && servicesInitialized.serverReady && !mcpReady) {
+                    mcpReady = true;
+                    clearTimeout(initializationTimeout);
+                    console.log('✅ MCP Server is ready - all essential services initialized');
+
+                    // Initialize handshake
+                    setTimeout(async () => {
+                        try {
+                            await initializeMCPHandshake();
+                            resolve(true);
+                        } catch (err) {
+                            reject(err);
+                        }
+                    }, 1000);
+                }
+            };
+
             let initializationTimeout = setTimeout(() => {
                 console.log('⏰ MCP initialization timeout check...');
                 console.log('📊 Services status:', servicesInitialized);
                 console.log('📄 Recent output:', allOutput.slice(-500)); // Last 500 chars
                 
-                // Check if core services are ready
-                if (servicesInitialized.drive && servicesInitialized.gmail && servicesInitialized.serverReady) {
+                // Check if core services are ready (relaxed check)
+                if (servicesInitialized.drive && servicesInitialized.calendar && 
+                    servicesInitialized.docs && servicesInitialized.serverReady) {
                     console.log('✅ MCP Server detected as ready (essential services initialized)');
                     mcpReady = true;
                     clearTimeout(initializationTimeout);
@@ -212,40 +258,8 @@ async function initializeMCP(userId) {
                     if (line.trim()) {
                         console.log('MCP Output:', line);
 
-                        // Track service initialization
-                        if (line.includes('Google Drive service initialized')) {
-                            servicesInitialized.drive = true;
-                        }
-                        if (line.includes('Gmail service initialized')) {
-                            servicesInitialized.gmail = true;
-                        }
-                        if (line.includes('Google Calendar service initialized')) {
-                            servicesInitialized.calendar = true;
-                        }
-                        if (line.includes('Google Docs service initialized')) {
-                            servicesInitialized.docs = true;
-                        }
-                        if (line.includes('Server ready with Google Drive') || 
-                            line.includes('Waiting for initialization command')) {
-                            servicesInitialized.serverReady = true;
-                        }
-
-                        // Check if we can proceed with initialization
-                        if (servicesInitialized.drive && servicesInitialized.gmail && servicesInitialized.serverReady && !mcpReady) {
-                            mcpReady = true;
-                            clearTimeout(initializationTimeout);
-                            console.log('✅ MCP Server is ready - all essential services initialized');
-
-                            // Initialize handshake
-                            setTimeout(async () => {
-                                try {
-                                    await initializeMCPHandshake();
-                                    resolve(true);
-                                } catch (err) {
-                                    reject(err);
-                                }
-                            }, 1000);
-                        }
+                        // Check for service initialization in stdout
+                        checkServiceStatus(line);
 
                         // Handle JSON responses
                         try {
@@ -277,12 +291,25 @@ async function initializeMCP(userId) {
 
             mcpProcess.stderr.on('data', (data) => {
                 const errorOutput = data.toString();
+                errorBuffer += errorOutput;
+                allOutput += errorOutput;
                 
-                // Filter out known warnings
-                if (!errorOutput.includes('DeprecationWarning') &&
-                    !errorOutput.includes('file_cache is only supported') &&
-                    !errorOutput.includes('oauth2client')) {
-                    console.error(`[MCP STDERR]: ${errorOutput}`);
+                // Process stderr line by line
+                const lines = errorBuffer.split('\n');
+                errorBuffer = lines.pop() || '';
+
+                for (let line of lines) {
+                    if (line.trim()) {
+                        // Check for service initialization in stderr
+                        checkServiceStatus(line);
+
+                        // Filter out known warnings for logging
+                        if (!line.includes('DeprecationWarning') &&
+                            !line.includes('file_cache is only supported') &&
+                            !line.includes('oauth2client')) {
+                            console.log(`[MCP STDERR]: ${line}`);
+                        }
+                    }
                 }
 
                 // Check for critical errors
@@ -319,7 +346,6 @@ async function initializeMCP(userId) {
 
     return mcpInitializationPromise;
 }
-
 async function initializeMCPHandshake() {
     try {
         console.log('🤝 Starting MCP handshake...');
