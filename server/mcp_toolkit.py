@@ -4,7 +4,10 @@ import sys
 import base64
 import io
 import re
+import tiktoken
 import mimetypes # <--- ADDED
+from docx import Document
+from PyPDF2 import PdfReader
 from typing import Any, Dict, List, Optional
 from datetime import datetime, timedelta
 from html import unescape
