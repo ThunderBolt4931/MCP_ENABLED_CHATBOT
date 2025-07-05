@@ -7,7 +7,7 @@
     "start": "node server.js",
     "dev": "nodemon server.js",
     "build": "echo 'No build step required for backend'",
-    "install-python-deps": "pip install google-auth google-auth-oauthlib google-auth-httplib2 google-api-python-client mcp PyPDF2 reportlab",
+    "install-python-deps": "pip install google-auth tiktoken python-docx google-auth-oauthlib google-auth-httplib2 google-api-python-client mcp PyPDF2 reportlab",
     "db:setup": "node setup-db.js"
   },
   "engines": {
