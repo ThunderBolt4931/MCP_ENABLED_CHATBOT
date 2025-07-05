@@ -139,6 +139,14 @@ async function initializeMCP(userId) {
             try {
                 tokenData = await AuthToken.findByUserId(userId);
                 if (!tokenData) throw new Error('No auth token found for user');
+                console.log('🔍 Token data loaded from database:');//debug
+                console.log('  - User ID:', userId);//debug
+                console.log('  - Access token exists:', !!tokenData.access_token);//debug
+                console.log('  - Access token length:', tokenData.access_token ? tokenData.access_token.length : 0);//debug
+                console.log('  - Refresh token exists:', !!tokenData.refresh_token);//debug
+                console.log('  - Refresh token length:', tokenData.refresh_token ? tokenData.refresh_token.length : 0);//debug
+                console.log('  - Expires at:', tokenData.expires_at);//debug
+                console.log('  - Token type:', typeof tokenData.access_token);//debug
             } catch (err) {
                 throw new Error(`Failed to load token from database: ${err.message}`);
             }
@@ -154,6 +162,12 @@ async function initializeMCP(userId) {
                 GOOGLE_CLIENT_SECRET: process.env.GOOGLE_CLIENT_SECRET,
                 SESSION_USER_ID: userId
             };
+            console.log('🔍 Environment variables being passed to Python:'); //debug
+            console.log('  - GOOGLE_ACCESS_TOKEN exists:', !!mcpEnv.GOOGLE_ACCESS_TOKEN);//debug
+            console.log('  - GOOGLE_REFRESH_TOKEN exists:', !!mcpEnv.GOOGLE_REFRESH_TOKEN);//debug
+            console.log('  - GOOGLE_CLIENT_ID exists:', !!mcpEnv.GOOGLE_CLIENT_ID);//debug
+            console.log('  - GOOGLE_CLIENT_SECRET exists:', !!mcpEnv.GOOGLE_CLIENT_SECRET);//debug
+            console.log('  - SESSION_USER_ID:', mcpEnv.SESSION_USER_ID);//debug
 
             console.log('🔐 Starting MCP with environment variables set');
             console.log('🔐 Python command:', pythonCmd);
