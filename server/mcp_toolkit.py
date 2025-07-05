@@ -1369,17 +1369,37 @@ def gmail_find_messages_with_attachments(
 def gmail_read_attachment_content(message_id: str, attachment_id: Optional[str] = None) -> str:
     """
     Reads and extracts text content from a PDF, DOCX, or TXT attachment in a Gmail message.
-    If attachment_id is not provided, it automatically uses the first supported attachment found.
-    Maximum token limit: 3000 tokens
+    Enhanced with better error handling and authentication checks.
     """
+    if not gmail_service:
+        return "Gmail service is not initialized. Please check authentication."
+    
     try:
+        # Test Gmail access first
+        try:
+            profile = gmail_service.users().getProfile(userId='me').execute()
+            print(f"Gmail access verified for: {profile.get('emailAddress', 'Unknown')}", file=sys.stderr)
+        except HttpError as auth_error:
+            print(f"Gmail authentication check failed: {auth_error}", file=sys.stderr)
+            return f"Gmail authentication failed: {auth_error}"
+        
         # Maximum token limit
         MAX_TOKENS = 30000
         
-        # Initialize tokenizer (using cl100k_base encoding which is used by GPT-4)
+        # Initialize tokenizer
         encoding = tiktoken.get_encoding("cl100k_base")
 
-        message = gmail_service.users().messages().get(userId='me', id=message_id, format='full').execute()
+        # Get the message with explicit error handling
+        try:
+            message = gmail_service.users().messages().get(
+                userId='me', 
+                id=message_id, 
+                format='full'
+            ).execute()
+        except HttpError as msg_error:
+            print(f"Error retrieving message {message_id}: {msg_error}", file=sys.stderr)
+            return f"Error retrieving message: {msg_error}"
+        
         parts = message.get("payload", {}).get("parts", [])
         matched_part = None
 
@@ -1404,27 +1424,46 @@ def gmail_read_attachment_content(message_id: str, attachment_id: Optional[str] 
 
         filename = matched_part.get("filename", "attachment").lower()
 
-        # Download and decode the attachment
-        attachment = gmail_service.users().messages().attachments().get(
-            userId='me', messageId=message_id, id=attachment_id
-        ).execute()
-        data = base64.urlsafe_b64decode(attachment["data"])
-        file_stream = io.BytesIO(data)
+        # Download and decode the attachment with explicit error handling
+        try:
+            attachment = gmail_service.users().messages().attachments().get(
+                userId='me', 
+                messageId=message_id, 
+                id=attachment_id
+            ).execute()
+        except HttpError as att_error:
+            print(f"Error downloading attachment {attachment_id}: {att_error}", file=sys.stderr)
+            return f"Error downloading attachment: {att_error}"
+        
+        try:
+            data = base64.urlsafe_b64decode(attachment["data"])
+            file_stream = io.BytesIO(data)
+        except Exception as decode_error:
+            return f"Error decoding attachment data: {decode_error}"
 
-        # Extract text
+        # Extract text (rest of the function remains the same)
         extracted_text = ""
         if filename.endswith(".pdf"):
-            reader = PdfReader(file_stream)
-            for page in reader.pages:
-                extracted_text += page.extract_text() or ""
+            try:
+                reader = PdfReader(file_stream)
+                for page in reader.pages:
+                    extracted_text += page.extract_text() or ""
+            except Exception as pdf_error:
+                return f"Error reading PDF: {pdf_error}"
 
         elif filename.endswith(".docx"):
-            doc = Document(file_stream)
-            for para in doc.paragraphs:
-                extracted_text += para.text + "\n"
+            try:
+                doc = Document(file_stream)
+                for para in doc.paragraphs:
+                    extracted_text += para.text + "\n"
+            except Exception as docx_error:
+                return f"Error reading DOCX: {docx_error}"
 
         elif filename.endswith(".txt"):
-            extracted_text += file_stream.read().decode("utf-8", errors="ignore")
+            try:
+                extracted_text += file_stream.read().decode("utf-8", errors="ignore")
+            except Exception as txt_error:
+                return f"Error reading TXT: {txt_error}"
 
         else:
             return f"Unsupported file type: {filename}"
@@ -1435,11 +1474,12 @@ def gmail_read_attachment_content(message_id: str, attachment_id: Optional[str] 
         # Check token count of extracted text
         token_count = len(encoding.encode(extracted_text))
         if token_count > MAX_TOKENS:
-            return f"File '{filename}' is too large ({token_count} tokens). Maximum allowed is {MAX_TOKENS} tokens. The file will not be loaded."
+            return f"File '{filename}' is too large ({token_count} tokens). Maximum allowed is {MAX_TOKENS} tokens."
 
         return extracted_text.strip()
 
     except Exception as e:
+        print(f"Unexpected error in gmail_read_attachment_content: {e}", file=sys.stderr)
         return f"Error extracting attachment text: {str(e)}"
     
 @mcp.tool()
