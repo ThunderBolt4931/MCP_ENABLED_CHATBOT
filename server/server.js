@@ -108,21 +108,44 @@ async function initializeMCP(userId) {
         return false;
     }
 
-    // If already initializing, wait for it
+    console.log(`🔄 MCP initialization requested for user: ${userId}`);
+    console.log(`🔄 Current MCP user: ${currentUserId}`);
+    console.log(`🔄 MCP ready status: ${mcpReady}`);
+
+    // Check if we need to switch users or reinitialize
+    const needsReinitialization = !mcpReady || currentUserId !== userId || !mcpProcess;
+    
+    if (needsReinitialization) {
+        console.log(`🔄 MCP needs reinitialization: ready=${mcpReady}, currentUser=${currentUserId}, targetUser=${userId}, process=${!!mcpProcess}`);
+        
+        // Reset initialization promise to force a fresh start
+        mcpInitializationPromise = null;
+        
+        // Kill existing process if any
+        if (mcpProcess) {
+            console.log('🔄 Terminating existing MCP process for user switch');
+            mcpProcess.kill();
+            mcpProcess = null;
+            mcpReady = false;
+            currentUserId = null;
+            availableTools = [];
+            pendingResponses.clear();
+        }
+    } else {
+        console.log('✅ MCP already initialized for current user');
+        return true;
+    }
+
+    // If already initializing for this user, wait for it
     if (mcpInitializationPromise) {
+        console.log('⏳ MCP initialization already in progress, waiting...');
         return mcpInitializationPromise;
     }
 
     mcpInitializationPromise = new Promise(async (resolve, reject) => {
         try {
+            console.log(`🚀 Starting MCP initialization for user: ${userId}`);
             currentUserId = userId;
-
-            // Kill existing process if any
-            if (mcpProcess) {
-                mcpProcess.kill();
-                mcpProcess = null;
-                mcpReady = false;
-            }
 
             // Find Python executable
             const pythonCmd = process.platform === 'win32' ? 'python' : 'python3';
@@ -139,14 +162,6 @@ async function initializeMCP(userId) {
             try {
                 tokenData = await AuthToken.findByUserId(userId);
                 if (!tokenData) throw new Error('No auth token found for user');
-                console.log('🔍 Token data loaded from database:');//debug
-                console.log('  - User ID:', userId);//debug
-                console.log('  - Access token exists:', !!tokenData.access_token);//debug
-                console.log('  - Access token length:', tokenData.access_token ? tokenData.access_token.length : 0);//debug
-                console.log('  - Refresh token exists:', !!tokenData.refresh_token);//debug
-                console.log('  - Refresh token length:', tokenData.refresh_token ? tokenData.refresh_token.length : 0);//debug
-                console.log('  - Expires at:', tokenData.expires_at);//debug
-                console.log('  - Token type:', typeof tokenData.access_token);//debug
             } catch (err) {
                 throw new Error(`Failed to load token from database: ${err.message}`);
             }
@@ -162,16 +177,11 @@ async function initializeMCP(userId) {
                 GOOGLE_CLIENT_SECRET: process.env.GOOGLE_CLIENT_SECRET,
                 SESSION_USER_ID: userId
             };
-            console.log('🔍 Environment variables being passed to Python:'); //debug
-            console.log('  - GOOGLE_ACCESS_TOKEN exists:', !!mcpEnv.GOOGLE_ACCESS_TOKEN);//debug
-            console.log('  - GOOGLE_REFRESH_TOKEN exists:', !!mcpEnv.GOOGLE_REFRESH_TOKEN);//debug
-            console.log('  - GOOGLE_CLIENT_ID exists:', !!mcpEnv.GOOGLE_CLIENT_ID);//debug
-            console.log('  - GOOGLE_CLIENT_SECRET exists:', !!mcpEnv.GOOGLE_CLIENT_SECRET);//debug
-            console.log('  - SESSION_USER_ID:', mcpEnv.SESSION_USER_ID);//debug
 
             console.log('🔐 Starting MCP with environment variables set');
             console.log('🔐 Python command:', pythonCmd);
             console.log('🔐 MCP path:', mcpPath);
+            console.log('🔐 User ID:', userId);
 
             mcpProcess = spawn(pythonCmd, [mcpPath], {
                 stdio: ['pipe', 'pipe', 'pipe'],
@@ -220,14 +230,16 @@ async function initializeMCP(userId) {
                     servicesInitialized.docs && servicesInitialized.serverReady && !mcpReady) {
                     mcpReady = true;
                     clearTimeout(initializationTimeout);
-                    console.log('✅ MCP Server is ready - all essential services initialized');
+                    console.log(`✅ MCP Server is ready for user ${userId} - all essential services initialized`);
 
                     // Initialize handshake
                     setTimeout(async () => {
                         try {
                             await initializeMCPHandshake();
+                            console.log(`✅ MCP fully initialized for user: ${userId}`);
                             resolve(true);
                         } catch (err) {
+                            console.error(`❌ MCP handshake failed for user ${userId}:`, err);
                             reject(err);
                         }
                     }, 1000);
@@ -242,21 +254,23 @@ async function initializeMCP(userId) {
                 // Check if core services are ready (relaxed check)
                 if (servicesInitialized.drive && servicesInitialized.calendar && 
                     servicesInitialized.docs && servicesInitialized.serverReady) {
-                    console.log('✅ MCP Server detected as ready (essential services initialized)');
+                    console.log(`✅ MCP Server detected as ready for user ${userId} (essential services initialized)`);
                     mcpReady = true;
                     clearTimeout(initializationTimeout);
                     
                     setTimeout(async () => {
                         try {
                             await initializeMCPHandshake();
+                            console.log(`✅ MCP fully initialized for user: ${userId}`);
                             resolve(true);
                         } catch (err) {
+                            console.error(`❌ MCP handshake failed for user ${userId}:`, err);
                             reject(err);
                         }
                     }, 1000);
                 } else {
-                    console.log('❌ MCP initialization timeout - services not ready');
-                    reject(new Error('MCP initialization timeout'));
+                    console.log(`❌ MCP initialization timeout for user ${userId} - services not ready`);
+                    reject(new Error(`MCP initialization timeout for user ${userId}`));
                 }
             }, 25000); // 25 second timeout
 
@@ -270,7 +284,7 @@ async function initializeMCP(userId) {
 
                 for (let line of lines) {
                     if (line.trim()) {
-                        console.log('MCP Output:', line);
+                        console.log(`MCP Output [${userId}]:`, line);
 
                         // Check for service initialization in stdout
                         checkServiceStatus(line);
@@ -278,7 +292,7 @@ async function initializeMCP(userId) {
                         // Handle JSON responses
                         try {
                             const response = JSON.parse(line);
-                            console.log('📥 MCP JSON Response:', response);
+                            console.log(`📥 MCP JSON Response [${userId}]:`, response);
 
                             if (response.id && pendingResponses.has(response.id)) {
                                 const { resolve: resolveReq, reject: rejectReq } = pendingResponses.get(response.id);
@@ -296,7 +310,7 @@ async function initializeMCP(userId) {
                                 !line.includes('oauth2client') && 
                                 !line.includes('DeprecationWarning') &&
                                 !line.includes('file_cache is only supported')) {
-                                console.log('📄 MCP Status:', line);
+                                console.log(`📄 MCP Status [${userId}]:`, line);
                             }
                         }
                     }
@@ -321,7 +335,7 @@ async function initializeMCP(userId) {
                         if (!line.includes('DeprecationWarning') &&
                             !line.includes('file_cache is only supported') &&
                             !line.includes('oauth2client')) {
-                            console.log(`[MCP STDERR]: ${line}`);
+                            console.log(`[MCP STDERR ${userId}]: ${line}`);
                         }
                     }
                 }
@@ -331,14 +345,16 @@ async function initializeMCP(userId) {
                     errorOutput.includes('ImportError') ||
                     errorOutput.includes('SyntaxError')) {
                     clearTimeout(initializationTimeout);
-                    reject(new Error(`MCP Python error: ${errorOutput}`));
+                    reject(new Error(`MCP Python error for user ${userId}: ${errorOutput}`));
                 }
             });
 
             mcpProcess.on('close', (code) => {
-                console.log(`MCP process exited with code ${code}`);
+                console.log(`MCP process for user ${userId} exited with code ${code}`);
                 mcpProcess = null;
                 mcpReady = false;
+                currentUserId = null;
+                mcpInitializationPromise = null;
                 clearTimeout(initializationTimeout);
 
                 if (code !== 0) {
@@ -347,13 +363,21 @@ async function initializeMCP(userId) {
             });
 
             mcpProcess.on('error', (error) => {
-                console.error('❌ MCP process error:', error);
+                console.error(`❌ MCP process error for user ${userId}:`, error);
+                mcpProcess = null;
+                mcpReady = false;
+                currentUserId = null;
+                mcpInitializationPromise = null;
                 clearTimeout(initializationTimeout);
                 reject(error);
             });
 
         } catch (error) {
-            console.error('❌ MCP initialization error:', error);
+            console.error(`❌ MCP initialization error for user ${userId}:`, error);
+            mcpProcess = null;
+            mcpReady = false;
+            currentUserId = null;
+            mcpInitializationPromise = null;
             reject(error);
         }
     });
