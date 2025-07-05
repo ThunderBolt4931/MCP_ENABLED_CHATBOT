@@ -810,6 +810,7 @@ const getAllMCPTools = () => [
             }
         }
     },
+    
     {
         type: "function",
         function: {
@@ -879,23 +880,47 @@ const getAllMCPTools = () => [
         }
     },
 
-    // Google Calendar Tools (6 tools)
+    // Google Calendar Tools (3 tools)
     {
         type: "function",
         function: {
-            name: "calendar_create_event",
-            description: "Create a new event in Google Calendar",
+            name: "calendar_create_event_with_invitations",
+            description: "Create a calendar event and automatically send invitations to attendees",
             parameters: {
                 type: "object",
                 properties: {
-                    summary: { type: "string", description: "Event title/summary" },
-                    start_time: { type: "string", description: "Event start time (ISO format)" },
-                    end_time: { type: "string", description: "Event end time (ISO format)" },
-                    description: { type: "string", description: "Event description (optional)" },
-                    attendees: { type: "array", items: { type: "string" }, description: "List of attendee emails" },
-                    location: { type: "string", description: "Event location (optional)" }
+                    summary: { 
+                        type: "string", 
+                        description: "Event title" 
+                    },
+                    startTime: { 
+                        type: "string", 
+                        description: "RFC3339 start time (e.g., '2024-01-15T10:00:00Z')" 
+                    },
+                    endTime: { 
+                        type: "string", 
+                        description: "RFC3339 end time (e.g., '2024-01-15T11:00:00Z')" 
+                    },
+                    attendees: { 
+                        type: "array", 
+                        items: { type: "string" },
+                        description: "List of attendee emails (optional)" 
+                    },
+                    location: { 
+                        type: "string", 
+                        description: "Event location (optional)" 
+                    },
+                    description: { 
+                        type: "string", 
+                        description: "Event description (optional)" 
+                    },
+                    send_invitations: { 
+                        type: "boolean", 
+                        description: "Whether to send email invitations (default: true)",
+                        default: true
+                    }
                 },
-                required: ["summary", "start_time", "end_time"]
+                required: ["summary", "startTime", "endTime"]
             }
         }
     },
