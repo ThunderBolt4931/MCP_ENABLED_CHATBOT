@@ -1199,7 +1199,7 @@ app.get('/auth/user', async (req, res) => {
                     user: {
                         ...decoded,
                         preferences: preferences || {
-                            preferred_model: 'gpt-4o-mini',
+                            preferred_model: 'gpt-4',
                             enabled_tools: [],
                             settings: {}
                         }
@@ -1270,7 +1270,7 @@ app.post('/auth/logout', async (req, res) => {
 // Chat endpoint with database integration
 app.post('/api/chat', requireAuth, upload.array('attachments', 5), async (req, res) => {
     try {
-        const { message, chatId, model = 'gpt-4o-mini', enabledTools = '[]' } = req.body;
+        const { message, chatId, model = 'gpt-4', enabledTools = '[]' } = req.body;
         const userId = req.user.id;
         const files = req.files || [];
 
@@ -1539,7 +1539,7 @@ Always think step-by-step and use multiple tools when needed to fully complete t
 
         // Calculate estimated cost
         const modelPricing = {
-            'gpt-4o-mini': { input: 0.03 / 1000, output: 0.06 / 1000 },
+            'gpt-4': { input: 0.03 / 1000, output: 0.06 / 1000 },
             'gpt-4-turbo': { input: 0.01 / 1000, output: 0.03 / 1000 },
             'gpt-3.5-turbo': { input: 0.001 / 1000, output: 0.002 / 1000 }
         };
