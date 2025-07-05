@@ -64,14 +64,15 @@ def load_credentials():
     client_id = os.getenv("GOOGLE_CLIENT_ID")
     client_secret = os.getenv("GOOGLE_CLIENT_SECRET")
 
-    if all([access_token, refresh_token, client_id, client_secret]):
-        print(access_token,file=sys.stderr) #debugging
-        print(refresh_token,file=sys.stderr)# debugging
-        print(expires_at,file=sys.stderr) #debugging
-        print(client_id,file=sys.stderr)
-        
-        print("got all required environment variables for Google OAuth",file=sys.stderr)
-
+    print(f"Environment check:", file=sys.stderr)
+    print(f"  - Access token: {'✓' if access_token else '✗'}", file=sys.stderr)
+    print(f"  - Refresh token: {'✓' if refresh_token else '✗'}", file=sys.stderr)
+    print(f"  - Client ID: {'✓' if client_id else '✗'}", file=sys.stderr)
+    print(f"  - Client secret: {'✓' if client_secret else '✗'}", file=sys.stderr)
+    print(f"  - Expires at: {expires_at}", file=sys.stderr)
+    if not all([access_token, refresh_token, client_id, client_secret]):
+        print("Missing required OAuth credentials", file=sys.stderr)
+        return None
     try:
         creds = Credentials(
             token=access_token,
@@ -86,13 +87,21 @@ def load_credentials():
         if expires_at:
             creds.expiry = datetime.utcfromtimestamp(int(expires_at) / 1000)
 
-        if creds and creds.expired and creds.refresh_token:
-            print("🔁 Refreshing token...",file=sys.stderr)
-            creds.refresh(Request())
+        if creds.expired and creds.refresh_token:
+            print("Token expired, refreshing...", file=sys.stderr)
+            try:
+                creds.refresh(Request())
+                print("Token refreshed successfully", file=sys.stderr)
+            except Exception as e:
+                print(f"Token refresh failed: {e}", file=sys.stderr)
+                return None
+        elif creds.expired:
+            print("Token expired and no refresh token available", file=sys.stderr)
+            return None
 
         return creds
     except Exception as e:
-        print("❌ Error loading credentials:", e,file=sys.stderr)
+        print(f"Error loading credentials: {e}", file=sys.stderr)
         return None
 # ==================== GOOGLE DRIVE FUNCTIONS ====================
 
@@ -966,8 +975,9 @@ def gmail_list_messages(max_results: int = 10, query: Optional[str] = None) -> s
     except HttpError as e:
         return f"Gmail API Error: {str(e)}"
 
+
 @mcp.tool()
-def gmail_read_message(message_id: str, include_attachments_info: bool = True) -> str:
+def gmail_read_message_without_attachments(message_id: str, include_attachments_info: bool = True) -> str:
     """Read email content in clean, AI-friendly format with optional attachment info"""
     try:
         message = gmail_service.users().messages().get(
@@ -1066,204 +1076,351 @@ def get_attachment_info(payload):
     return attachments
 
 @mcp.tool()
-def gmail_read_attachments(
-    message_id: Optional[str] = None,
+def gmail_find_messages_with_attachments(
+    max_results: int, 
+    query: Optional[str] = None,
     sender: Optional[str] = None,
     subject_contains: Optional[str] = None,
-    days_back: int = 7,
-    max_results: int = 5,
-    max_attachment_size_mb: int = 10,
-    read_text_content: bool = True
+    date_after: Optional[str] = None,
+    date_before: Optional[str] = None,
+    attachment_type: Optional[str] = None,
+    mime_type: Optional[str] = None
 ) -> str:
     """
-    Efficiently read email attachments with flexible search options
+    Find Gmail messages with attachments based on search criteria
     
     Args:
-        message_id: Specific email ID to read attachments from
-        sender: Filter by sender email/name  
-        subject_contains: Filter by subject keywords
-        days_back: How many days back to search (default: 7)
-        max_results: Max emails to process (default: 5)
-        max_attachment_size_mb: Max attachment size to process in MB
-        read_text_content: Whether to extract and preview text content
-    """
-    try:
-        # If specific message ID provided, process that email only
-        if message_id:
-            return process_single_email_attachments(message_id, max_attachment_size_mb, read_text_content)
-        
-        # Build search query for emails with attachments
-        query_parts = ["has:attachment"]
-        
-        # Add date filter
-        date_filter = datetime.now() - timedelta(days=days_back)
-        query_parts.append(f"after:{date_filter.strftime('%Y/%m/%d')}")
-        
-        # Add optional filters
-        if sender:
-            query_parts.append(f"from:({sender})")
-        if subject_contains:
-            query_parts.append(f'subject:"{subject_contains}"')
-        
-        search_query = " ".join(query_parts)
-        
-        # Search for messages
-        results = gmail_service.users().messages().list(
-            userId='me',
-            q=search_query,
-            maxResults=max_results
-        ).execute()
-        
-        messages = results.get('messages', [])
-        
-        if not messages:
-            return f"No emails with attachments found.\nSearch criteria: {search_query}"
-        
-        response = f"FOUND {len(messages)} EMAIL(S) WITH ATTACHMENTS\n"
-        response += f"Search Query: {search_query}\n\n"
-        
-        # Process each email
-        for i, message in enumerate(messages, 1):
-            try:
-                email_response = process_single_email_attachments(
-                    message['id'], max_attachment_size_mb, read_text_content
-                )
-                response += f"EMAIL {i}:\n{email_response}\n"
-                response += "="*60 + "\n"
-                
-            except Exception as e:
-                response += f"EMAIL {i}: Error processing {message['id']} - {str(e)}\n"
-                continue
-        
-        return response
-        
-    except Exception as e:
-        return f"Error reading attachments: {str(e)}"
-
-def process_single_email_attachments(message_id: str, max_size_mb: int, read_content: bool) -> str:
-    """Process attachments from a single email"""
-    try:
-        # Get full message
-        message = gmail_service.users().messages().get(
-            userId='me', id=message_id, format='full'
-        ).execute()
-        
-        # Extract email metadata
-        headers = message['payload'].get('headers', [])
-        subject = next((h['value'] for h in headers if h['name'] == 'Subject'), 'No Subject')
-        sender = next((h['value'] for h in headers if h['name'] == 'From'), 'Unknown Sender')
-        date = next((h['value'] for h in headers if h['name'] == 'Date'), 'Unknown Date')
-        
-        sender_clean = sender.split('<')[0].strip().strip('"') if '<' in sender else sender
-        
-        response = f"Subject: {subject}\n"
-        response += f"From: {sender_clean}\n"
-        response += f"Date: {date}\n"
-        response += f"Message ID: {message_id}\n\n"
-        
-        # Process attachments
-        attachments = extract_attachments_from_message(message_id, message['payload'], max_size_mb, read_content)
-        
-        if not attachments:
-            return response + "No attachments found in this email."
-        
-        response += f"ATTACHMENTS ({len(attachments)}):\n"
-        
-        for i, attachment in enumerate(attachments, 1):
-            response += f"\n{i}. {attachment['filename']}\n"
-            response += f"   Type: {attachment['mime_type']}\n"
-            response += f"   Size: {attachment['size']}\n"
-            response += f"   Status: {attachment['status']}\n"
-            
-            if attachment.get('content_preview'):
-                response += f"   Content Preview:\n   {attachment['content_preview'][:300]}...\n"
-        
-        return response
-        
-    except Exception as e:
-        return f"Error processing email {message_id}: {str(e)}"
-
-def extract_attachments_from_message(message_id: str, payload: dict, max_size_mb: int, read_content: bool) -> List[Dict]:
-    """Extract and optionally read attachment content from message payload"""
-    attachments = []
+        max_results: Maximum number of messages to return 
+        query: Custom Gmail search query
+        sender: Filter by sender email/name
+        subject_contains: Filter by subject containing text
+        date_after: Messages after date (YYYY/MM/DD format)
+        date_before: Messages before date (YYYY/MM/DD format)
+        attachment_type: Filter by attachment extension (pdf, xlsx, docx, etc.)
+        mime_type: Filter by exact MIME type (e.g., 'application/pdf')
     
-    def process_parts(parts):
-        for part in parts:
-            if 'parts' in part:
-                process_parts(part['parts'])
-            elif part.get('filename') and part['body'].get('attachmentId'):
-                filename = part['filename']
-                mime_type = part['mimeType']
-                size_bytes = part['body'].get('size', 0)
-                attachment_id = part['body']['attachmentId']
+    Returns:
+        Clean JSON string with message details and attachment info
+    """
+    
+    # Complete MIME type mappings
+    ATTACHMENT_MIME_TYPES = {
+        # Documents
+        'pdf': 'application/pdf',
+        'doc': 'application/msword',
+        'docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+        'rtf': 'application/rtf',
+        'odt': 'application/vnd.oasis.opendocument.text',
+        
+        # Spreadsheets
+        'xls': 'application/vnd.ms-excel',
+        'xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        'ods': 'application/vnd.oasis.opendocument.spreadsheet',
+        'csv': 'text/csv',
+        
+        # Presentations
+        'ppt': 'application/vnd.ms-powerpoint',
+        'pptx': 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+        'odp': 'application/vnd.oasis.opendocument.presentation',
+        
+        # Text files
+        'txt': 'text/plain',
+        'md': 'text/markdown',
+        'json': 'application/json',
+        'xml': 'application/xml',
+        'html': 'text/html',
+        'css': 'text/css',
+        'js': 'text/javascript',
+        
+        # Images
+        'jpg': 'image/jpeg',
+        'jpeg': 'image/jpeg',
+        'png': 'image/png',
+        'gif': 'image/gif',
+        'bmp': 'image/bmp',
+        'tiff': 'image/tiff',
+        'tif': 'image/tiff',
+        'svg': 'image/svg+xml',
+        'webp': 'image/webp',
+        
+        # Archives
+        'zip': 'application/zip',
+        'rar': 'application/x-rar-compressed',
+        '7z': 'application/x-7z-compressed',
+        'tar': 'application/x-tar',
+        'gz': 'application/gzip',
+        
+        # Audio
+        'mp3': 'audio/mpeg',
+        'wav': 'audio/wav',
+        'flac': 'audio/flac',
+        'aac': 'audio/aac',
+        'ogg': 'audio/ogg',
+        
+        # Video
+        'mp4': 'video/mp4',
+        'avi': 'video/x-msvideo',
+        'mov': 'video/quicktime',
+        'wmv': 'video/x-ms-wmv',
+        'flv': 'video/x-flv',
+        'mkv': 'video/x-matroska',
+        
+        # Google Workspace (native types)
+        'gdoc': 'application/vnd.google-apps.document',
+        'gsheet': 'application/vnd.google-apps.spreadsheet',
+        'gslides': 'application/vnd.google-apps.presentation',
+        'gdraw': 'application/vnd.google-apps.drawing',
+        'gform': 'application/vnd.google-apps.form',
+        'gsite': 'application/vnd.google-apps.site'
+    }
+    
+    try:
+        # Validate and process parameters
+        filter_mime_type = None
+        
+        # Check mime_type parameter first
+        if mime_type and mime_type.strip():
+            filter_mime_type = mime_type.strip()
+        
+        # If no mime_type but attachment_type is provided
+        elif attachment_type and attachment_type.strip():
+            ext = attachment_type.strip().lower()
+            if ext in ATTACHMENT_MIME_TYPES:
+                filter_mime_type = ATTACHMENT_MIME_TYPES[ext]
+            else:
+                return json.dumps({
+                    'status': 'error',
+                    'error': f'Unsupported attachment type: {attachment_type}',
+                    'supported_types': list(ATTACHMENT_MIME_TYPES.keys())
+                }, indent=2)
+        
+        # Build Gmail search query
+        search_parts = ['has:attachment']
+        
+        if query and query.strip():
+            search_parts.append(query.strip())
+        if sender and sender.strip():
+            search_parts.append(f'from:({sender.strip()})')
+        if subject_contains and subject_contains.strip():
+            search_parts.append(f'subject:({subject_contains.strip()})')
+        if date_after and date_after.strip():
+            search_parts.append(f'after:{date_after.strip()}')
+        if date_before and date_before.strip():
+            search_parts.append(f'before:{date_before.strip()}')
+        
+        search_query = ' '.join(search_parts)
+        
+        # Search messages
+        search_result = gmail_service.users().messages().list(
+            userId='me',
+            maxResults=max_results * 5,  # Get more to account for filtering
+            q=search_query
+        ).execute()
+        
+        message_list = search_result.get('messages', [])
+        
+        if not message_list:
+            return json.dumps({
+                'status': 'success',
+                'count': 0,
+                'search_query': search_query,
+                'messages': []
+            }, indent=2)
+        
+        # Process messages and filter by attachments
+        valid_messages = []
+        
+        for msg_ref in message_list:
+            if len(valid_messages) >= max_results:
+                break
                 
-                # Check size limit
-                size_mb = size_bytes / (1024 * 1024) if size_bytes else 0
+            try:
+                # Get full message
+                full_message = gmail_service.users().messages().get(
+                    userId='me',
+                    id=msg_ref['id'],
+                    format='full'
+                ).execute()
                 
-                attachment_info = {
-                    'filename': filename,
-                    'mime_type': mime_type,
-                    'size': format_file_size(str(size_bytes)),
-                    'attachment_id': attachment_id
+                # Extract email headers
+                headers_dict = {}
+                for header in full_message.get('payload', {}).get('headers', []):
+                    headers_dict[header['name']] = header['value']
+                
+                # Parse sender
+                from_field = headers_dict.get('From', 'Unknown Sender')
+                sender_name = from_field
+                if '<' in from_field and '>' in from_field:
+                    name_part = from_field.split('<')[0].strip().strip('"')
+                    email_part = from_field.split('<')[1].split('>')[0]
+                    sender_name = name_part if name_part else email_part
+                
+                # Find attachments
+                found_attachments = []
+                
+                def extract_attachments_recursive(payload):
+                    """Recursively extract attachments from message payload"""
+                    if 'parts' in payload:
+                        for part in payload['parts']:
+                            extract_attachments_recursive(part)
+                    else:
+                        filename = payload.get('filename', '').strip()
+                        if filename:  # Has a filename = it's an attachment
+                            attachment_mime = payload.get('mimeType', '')
+                            
+                            # Handle Google Workspace files
+                            if attachment_mime.startswith('application/vnd.google-apps'):
+                                export_mime = get_export_mime_type(attachment_mime)
+                                actual_mime = attachment_mime  # Keep original for comparison
+                            else:
+                                actual_mime = attachment_mime
+                            
+                            # Apply MIME type filter if specified
+                            if filter_mime_type:
+                                if actual_mime != filter_mime_type:
+                                    return  # Skip this attachment
+                            
+                            # Create attachment info
+                            attachment_info = {
+                                'filename': filename,
+                                'mime_type': actual_mime,
+                                'size_bytes': payload.get('body', {}).get('size', 0),
+                                'attachment_id': payload.get('body', {}).get('attachmentId', ''),
+                                'is_google_workspace': actual_mime.startswith('application/vnd.google-apps')
+                            }
+                            
+                            # Add export info for Google Workspace files
+                            if attachment_info['is_google_workspace']:
+                                attachment_info['export_mime_type'] = get_export_mime_type(actual_mime)
+                            
+                            found_attachments.append(attachment_info)
+                
+                # Extract all attachments
+                extract_attachments_recursive(full_message.get('payload', {}))
+                
+                # Skip messages with no matching attachments
+                if not found_attachments:
+                    continue
+                
+                # Create message object
+                message_data = {
+                    'message_id': msg_ref['id'],
+                    'subject': headers_dict.get('Subject', 'No Subject'),
+                    'from': sender_name,
+                    'from_full': from_field,
+                    'to': headers_dict.get('To', ''),
+                    'date': headers_dict.get('Date', ''),
+                    'snippet': full_message.get('snippet', ''),
+                    'attachments': found_attachments,
+                    'attachment_count': len(found_attachments),
+                    'total_size_bytes': sum(att.get('size_bytes', 0) for att in found_attachments)
                 }
                 
-                if size_mb > max_size_mb:
-                    attachment_info['status'] = f'Skipped - too large ({size_mb:.1f}MB > {max_size_mb}MB)'
-                    attachment_info['content_preview'] = None
-                else:
-                    try:
-                        # Download attachment data
-                        attachment_data = gmail_service.users().messages().attachments().get(
-                            userId='me',
-                            messageId=message_id,
-                            id=attachment_id
-                        ).execute()
-                        
-                        file_data = base64.urlsafe_b64decode(attachment_data['data'])
-                        attachment_info['status'] = 'Successfully downloaded'
-                        
-                        # Extract content preview if requested
-                        if read_content:
-                            attachment_info['content_preview'] = extract_attachment_content(file_data, mime_type)
-                        else:
-                            attachment_info['content_preview'] = None
-                            
-                    except Exception as e:
-                        attachment_info['status'] = f'Download failed: {str(e)}'
-                        attachment_info['content_preview'] = None
+                valid_messages.append(message_data)
                 
-                attachments.append(attachment_info)
+            except Exception as e:
+                # Skip problematic messages
+                continue
+        
+        # Return final results
+        return json.dumps({
+            'status': 'success',
+            'count': len(valid_messages),
+            'search_query': search_query,
+            'messages': valid_messages
+        }, indent=2)
+        
+    except HttpError as http_err:
+        return json.dumps({
+            'status': 'error',
+            'error': f'Gmail API error: {str(http_err)}',
+            'error_code': getattr(http_err, 'resp', {}).get('status', 'unknown')
+        }, indent=2)
     
-    if 'parts' in payload:
-        process_parts(payload['parts'])
-    
-    return attachments
-
-def extract_attachment_content(file_data: bytes, mime_type: str) -> str:
-    """Extract readable content from attachment based on MIME type"""
+    except Exception as general_err:
+        return json.dumps({
+            'status': 'error',
+            'error': f'Unexpected error: {str(general_err)}',
+            'error_type': type(general_err).__name__
+        }, indent=2)
+        
+@mcp.tool()
+def gmail_read_attchment_content(message_id: str, attachment_id: Optional[str] = None) -> str:
+    """
+    Reads and extracts text content from a PDF, DOCX, or TXT attachment in a Gmail message.
+    If attachment_id is not provided, it automatically uses the first supported attachment found.
+    Maximum token limit: 3000 tokens
+    """
     try:
-        if mime_type.startswith('text/'):
-            return file_data.decode('utf-8', errors='ignore')
+        # Maximum token limit
+        MAX_TOKENS = 30000
         
-        elif mime_type == 'application/json':
-            return file_data.decode('utf-8', errors='ignore')
-        
-        elif mime_type in ['application/xml', 'text/xml']:
-            return file_data.decode('utf-8', errors='ignore')
-        
-        elif mime_type == 'application/pdf':
-            # Basic PDF text extraction (you'd need PyPDF2 or similar for full extraction)
-            text = file_data.decode('utf-8', errors='ignore')
-            # Remove PDF binary parts and keep readable text
-            cleaned = re.sub(r'[^\x20-\x7E\n\r\t]', '', text)
-            return cleaned if cleaned.strip() else "PDF content (binary - use PDF reader)"
-        
-        else:
-            return f"Binary file ({mime_type}) - {len(file_data)} bytes"
-            
-    except Exception as e:
-        return f"Content extraction failed: {str(e)}"
+        # Initialize tokenizer (using cl100k_base encoding which is used by GPT-4)
+        encoding = tiktoken.get_encoding("cl100k_base")
 
+        message = gmail_service.users().messages().get(userId='me', id=message_id, format='full').execute()
+        parts = message.get("payload", {}).get("parts", [])
+        matched_part = None
+
+        if not attachment_id:
+            # Auto-select the first supported attachment
+            for part in parts:
+                filename = part.get("filename", "").lower()
+                if filename.endswith((".pdf", ".docx", ".txt")) and part.get("body", {}).get("attachmentId"):
+                    matched_part = part
+                    attachment_id = part["body"]["attachmentId"]
+                    break
+            if not matched_part:
+                return "No supported attachment (.pdf, .docx, .txt) found in this message."
+        else:
+            # Use the given attachment_id to find the part
+            for part in parts:
+                if part.get("body", {}).get("attachmentId") == attachment_id:
+                    matched_part = part
+                    break
+            if not matched_part:
+                return f"No attachment with ID {attachment_id} found in message {message_id}."
+
+        filename = matched_part.get("filename", "attachment").lower()
+
+        # Download and decode the attachment
+        attachment = gmail_service.users().messages().attachments().get(
+            userId='me', messageId=message_id, id=attachment_id
+        ).execute()
+        data = base64.urlsafe_b64decode(attachment["data"])
+        file_stream = io.BytesIO(data)
+
+        # Extract text
+        extracted_text = ""
+        if filename.endswith(".pdf"):
+            reader = PdfReader(file_stream)
+            for page in reader.pages:
+                extracted_text += page.extract_text() or ""
+
+        elif filename.endswith(".docx"):
+            doc = Document(file_stream)
+            for para in doc.paragraphs:
+                extracted_text += para.text + "\n"
+
+        elif filename.endswith(".txt"):
+            extracted_text += file_stream.read().decode("utf-8", errors="ignore")
+
+        else:
+            return f"Unsupported file type: {filename}"
+
+        if not extracted_text.strip():
+            return "Attachment was processed but no extractable text was found."
+
+        # Check token count of extracted text
+        token_count = len(encoding.encode(extracted_text))
+        if token_count > MAX_TOKENS:
+            return f"File '{filename}' is too large ({token_count} tokens). Maximum allowed is {MAX_TOKENS} tokens. The file will not be loaded."
+
+        return extracted_text.strip()
+
+    except Exception as e:
+        return f"Error extracting attachment text: {str(e)}"
+    
 @mcp.tool()
 def gmail_search_and_summarize(
     query: Optional[str] = None,
@@ -1423,113 +1580,6 @@ def gmail_delete_message(message_id: str) -> str:
     except Exception as e:
         return f"Error deleting email: {str(e)}"
 
-@mcp.tool()
-def gmail_send_with_drive_attachment(
-    to: str, subject: str, body: str, drive_file_id: str, 
-    share_with_recipient: bool = True
-) -> str:
-    """Send email with Google Drive file link"""
-    try:
-        # Get file info
-        file_metadata = drive_service.files().get(
-            fileId=drive_file_id, 
-            fields='name,webViewLink'
-        ).execute()
-        
-        file_name = file_metadata['name']
-        file_link = file_metadata['webViewLink']
-        
-        # Share file if requested
-        share_status = "not shared"
-        if share_with_recipient:
-            try:
-                permission = {
-                    'type': 'user',
-                    'role': 'reader', 
-                    'emailAddress': to
-                }
-                drive_service.permissions().create(
-                    fileId=drive_file_id,
-                    body=permission,
-                    sendNotificationEmail=False
-                ).execute()
-                share_status = "shared with recipient"
-            except:
-                share_status = "sharing failed"
-        
-        # Enhanced email body
-        enhanced_body = f"{body}\n\n---\nAttached Google Drive File: {file_name}\nLink: {file_link}"
-        
-        # Send email
-        profile = gmail_service.users().getProfile(userId='me').execute()
-        from_email = profile['emailAddress']
-        
-        msg = MIMEText(enhanced_body)
-        msg['to'] = to
-        msg['from'] = from_email
-        msg['subject'] = subject
-        raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
-        
-        result = gmail_service.users().messages().send(
-            userId='me', body={'raw': raw}
-        ).execute()
-        
-        return f"Email sent with Drive file!\nMessage ID: {result['id']}\nFile: {file_name} ({share_status})\nLink: {file_link}"
-    
-    except Exception as e:
-        return f"Error sending email with Drive attachment: {str(e)}"
-
-@mcp.tool()
-def gmail_send_multiple_attachments(
-    to: str, subject: str, body: str, file_paths: List[str]
-) -> str:
-    """Send email with multiple file attachments"""
-    try:
-        # Check files exist
-        missing_files = [f for f in file_paths if not os.path.exists(f)]
-        if missing_files:
-            return f"Files not found: {', '.join(missing_files)}"
-        
-        # Get sender info
-        profile = gmail_service.users().getProfile(userId='me').execute()
-        from_email = profile['emailAddress']
-        
-        # Create multipart message
-        msg = MIMEMultipart()
-        msg['to'] = to
-        msg['from'] = from_email
-        msg['subject'] = subject
-        msg.attach(MIMEText(body, 'plain'))
-        
-        attached_files = []
-        total_size = 0
-        
-        # Attach files
-        for file_path in file_paths:
-            filename = os.path.basename(file_path)
-            file_size = os.path.getsize(file_path)
-            total_size += file_size
-            
-            with open(file_path, 'rb') as f:
-                file_data = f.read()
-            
-            part = MIMEBase('application', 'octet-stream')
-            part.set_payload(file_data)
-            encoders.encode_base64(part)
-            part.add_header('Content-Disposition', f'attachment; filename= {filename}')
-            msg.attach(part)
-            
-            attached_files.append({'name': filename, 'size': format_file_size(str(file_size))})
-        
-        # Send email
-        raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
-        result = gmail_service.users().messages().send(userId='me', body={'raw': raw}).execute()
-        
-        files_info = ", ".join([f"{f['name']} ({f['size']})" for f in attached_files])
-        return f"Email sent with {len(attached_files)} attachments!\nMessage ID: {result['id']}\nFiles: {files_info}\nTotal Size: {format_file_size(str(total_size))}"
-        
-    except Exception as e:
-        return f"Error sending email with attachments: {str(e)}"
 # ==================== GOOGLE CALENDAR TOOLS ====================
 
 @mcp.tool()
@@ -1764,7 +1814,7 @@ def calendar_delete_event(event_id: str) -> str:
 def initialize_services():
     """Initialize all Google services."""
     global drive_service, gmail_service, calendar_service, docs_service
-    
+    print("Initializing Google services...", file=sys.stderr)
     creds = load_credentials()
     if not creds:
         print("Warning: No credentials available. Services will not be initialized.",file=sys.stderr)
@@ -1773,34 +1823,34 @@ def initialize_services():
     try:
         # Initialize Google Drive service
         drive_service = build('drive', 'v3', credentials=creds)
-        print("✅ Google Drive service initialized",file=sys.stderr)
+        print("Google Drive service initialized",file=sys.stderr)
         
         # Initialize Gmail service
         gmail_service = build('gmail', 'v1', credentials=creds)
         profile = gmail_service.users().getProfile(userId='me').execute()
-        print(f"✅ Gmail service initialized: {profile['emailAddress']}",file=sys.stderr)
+        print(f"Gmail service initialized: {profile['emailAddress']}",file=sys.stderr)
         
         # Initialize Calendar service
         calendar_service = build('calendar', 'v3', credentials=creds)
         calendar_list = calendar_service.calendarList().list().execute()
         primary_calendar = next((cal for cal in calendar_list.get('items', []) if cal.get('primary')), None)
         if primary_calendar:
-            print(f"✅ Google Calendar service initialized: {primary_calendar.get('summary', 'Primary Calendar')}",file=sys.stderr)
+            print(f"Google Calendar service initialized: {primary_calendar.get('summary', 'Primary Calendar')}",file=sys.stderr)
         
         # Initialize Docs service
         docs_service = build('docs', 'v1', credentials=creds)
-        print("✅ Google Docs service initialized",file=sys.stderr)
+        print("Google Docs service initialized",file=sys.stderr)
 
         if not PDF_SUPPORT:
-            print("⚠️ PDF libraries not installed. PDF creation/editing will be limited.", file=sys.stderr)
+            print("PDF libraries not installed. PDF creation/editing will be limited.", file=sys.stderr)
         
-        print("\n🚀 Server ready with Google Drive, Gmail, Calendar, and Docs integration",file=sys.stderr)
+        print("\nServer ready with Google Drive, Gmail, Calendar, and Docs integration",file=sys.stderr)
 
     except HttpError as e:
-        print(f"❌ A Google API error occurred during initialization: {e}",file=sys.stderr)
+        print(f"A Google API error occurred during initialization: {e}",file=sys.stderr)
         # Depending on severity, you might want to exit or handle this
     except Exception as e:
-        print(f"❌ An unexpected error occurred during initialization: {e}",file=sys.stderr)
+        print(f"An unexpected error occurred during initialization: {e}",file=sys.stderr)
 
 if __name__ == "__main__":
     initialize_services()
