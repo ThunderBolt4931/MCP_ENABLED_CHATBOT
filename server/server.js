@@ -1270,7 +1270,7 @@ app.post('/auth/logout', async (req, res) => {
 // Chat endpoint with database integration
 app.post('/api/chat', requireAuth, upload.array('attachments', 5), async (req, res) => {
     try {
-        const { message, chatId, model = 'gpt-4', enabledTools = '[]' } = req.body;
+        const { message, chatId, model = 'gpt-4o-mini', enabledTools = '[]' } = req.body;
         const userId = req.user.id;
         const files = req.files || [];
 
