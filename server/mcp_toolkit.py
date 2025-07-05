@@ -1366,7 +1366,7 @@ def gmail_find_messages_with_attachments(
         }, indent=2)
         
 @mcp.tool()
-def gmail_read_attchment_content(message_id: str, attachment_id: Optional[str] = None) -> str:
+def gmail_read_attachment_content(message_id: str, attachment_id: Optional[str] = None) -> str:
     """
     Reads and extracts text content from a PDF, DOCX, or TXT attachment in a Gmail message.
     If attachment_id is not provided, it automatically uses the first supported attachment found.
