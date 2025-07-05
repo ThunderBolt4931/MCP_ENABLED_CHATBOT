@@ -99,6 +99,137 @@ let requestId = 1;
 let availableTools = [];
 let pendingResponses = new Map();
 
+// Initialize MCP Server
+async function initializeMCP(userId) {
+    if (!userId) {
+        console.error('❌ Cannot start MCP without userId');
+        return;
+    }
+    currentUserId = userId;
+
+    const mcpPath = path.join(__dirname, 'mcp_toolkit.py');
+
+    let tokenData;
+    try {
+        tokenData = await AuthToken.findByUserId(userId);
+        if (!tokenData) throw new Error('No auth token found for user');
+    } catch (err) {
+        console.error('❌ Failed to load token from Supabase:', err.message);
+        return;
+    }
+
+    const mcpEnv = {
+        ...process.env,
+        PYTHONUNBUFFERED: '1',
+        GOOGLE_ACCESS_TOKEN: tokenData.access_token,
+        GOOGLE_REFRESH_TOKEN: tokenData.refresh_token,
+        GOOGLE_TOKEN_EXPIRES_AT: new Date(tokenData.expires_at).getTime().toString(),
+        SESSION_USER_ID: userId
+    };
+    console.log('🔐 Starting MCP with tokens:', {
+        access: tokenData.access_token?.substring(0, 5) + '...',
+        refresh: tokenData.refresh_token?.substring(0, 5) + '...',
+        expires: tokenData.expires_at
+    });
+    mcpProcess = spawn('python', [mcpPath], {
+        stdio: ['pipe', 'pipe', 'pipe'],
+        env: mcpEnv
+    });
+    let outputBuffer = '';
+
+    mcpProcess.stdout.on('data', (data) => {
+        outputBuffer += data.toString();
+        const lines = outputBuffer.split('\n');
+        outputBuffer = lines.pop() || '';
+
+        for (let line of lines) {
+            if (line.trim()) {
+                console.log('MCP Raw Output:', line);
+
+                if (line.includes('Server ready') || line.includes('Google Drive service initialized')) {
+                    mcpReady = true;
+                    console.log('✅ MCP Server is ready');
+                    // Get available tools once ready
+                    setTimeout(() => getAvailableTools(), 1000);
+                }
+
+                try {
+                    const response = JSON.parse(line);
+                    console.log('📥 MCP JSON Response:', response);
+
+                    if (response.id && pendingResponses.has(response.id)) {
+                        const { resolve, reject } = pendingResponses.get(response.id);
+                        pendingResponses.delete(response.id);
+
+                        if (response.error) {
+                            reject(new Error(response.error.message || JSON.stringify(response.error)));
+                        } else {
+                            resolve(response.result);
+                        }
+                    }
+                } catch (e) {
+                    if (!line.includes('WARNING') && !line.includes('oauth2client')) {
+                        console.log('📄 MCP Status:', line);
+                    }
+                }
+            }
+        }
+    });
+    mcpProcess.stderr.on('data', (data) => {
+        // This will print any and all messages from Python's stderr stream
+        console.error(`[PYTHON STDERR]: ${data.toString()}`);
+    });
+    // --- END OF ADDED BLOCK ---
+
+    // It's also good practice to know if the process closes unexpectedly
+    mcpProcess.on('close', (code) => {
+        console.log(`MCP process exited with code ${code}`);
+        mcpProcess = null; // Clear the process variable
+        mcpReady = false;
+    });
+
+    setTimeout(() => {
+        initializeMCPHandshake();
+    }, 2000);
+}
+function restartMCP() {
+    console.log('♻️ Restarting MCP due to updated credentials...');
+    if (mcpProcess) {
+        mcpProcess.kill();
+    }
+    setTimeout(() => {
+        initializeMCP(user.Id);
+    }, 1000);
+}
+
+async function initializeMCPHandshake() {
+    try {
+        console.log('🤝 Starting MCP handshake...');
+
+        const initResponse = await sendMCPRequest('initialize', {
+            protocolVersion: '2024-11-05',
+            capabilities: {
+                roots: {
+                    listChanged: true
+                },
+                sampling: {}
+            },
+            clientInfo: {
+                name: 'google-workspace-client',
+                version: '1.0.0'
+            }
+        });
+
+        console.log('✅ MCP Initialize response:', initResponse);
+        await sendMCPNotification('notifications/initialized');
+        console.log('✅ MCP Handshake completed');
+        await getAvailableTools();
+
+    } catch (error) {
+        console.error('❌ MCP Handshake failed:', error);
+    }
+}
+
 // Complete list of ALL MCP tools (30+ tools)
 const getAllMCPTools = () => [
     // Google Drive Tools (10 tools)
@@ -559,134 +690,6 @@ const getAllMCPTools = () => [
 
 ];
 
-// Initialize MCP Server
-async function initializeMCP(userId) {
-    if (!userId) {
-        console.error('❌ Cannot start MCP without userId');
-        return;
-    }
-    currentUserId = userId;
-
-    const mcpPath = path.join(__dirname, 'mcp_toolkit.py');
-
-    let tokenData;
-    try {
-        tokenData = await AuthToken.findByUserId(userId);
-        if (!tokenData) throw new Error('No auth token found for user');
-    } catch (err) {
-        console.error('❌ Failed to load token from Supabase:', err.message);
-        return;
-    }
-
-    const mcpEnv = {
-        ...process.env,
-        PYTHONUNBUFFERED: '1',
-        GOOGLE_ACCESS_TOKEN: tokenData.access_token,
-        GOOGLE_REFRESH_TOKEN: tokenData.refresh_token,
-        GOOGLE_TOKEN_EXPIRES_AT: new Date(tokenData.expires_at).getTime().toString(),
-        SESSION_USER_ID: userId
-    };
-    console.log('🔐 Starting MCP with tokens:', {
-        access: tokenData.access_token?.substring(0, 5) + '...',
-        refresh: tokenData.refresh_token?.substring(0, 5) + '...',
-        expires: tokenData.expires_at
-    });
-    mcpProcess = spawn('python', [mcpPath], {
-        stdio: ['pipe', 'pipe', 'pipe'],
-        env: mcpEnv
-    });
-    let outputBuffer = '';
-
-    mcpProcess.stdout.on('data', (data) => {
-        outputBuffer += data.toString();
-        const lines = outputBuffer.split('\n');
-        outputBuffer = lines.pop() || '';
-
-        for (let line of lines) {
-            if (line.trim()) {
-                console.log('MCP Raw Output:', line);
-
-                if (line.includes('Server ready') || line.includes('Google Drive service initialized')) {
-                    mcpReady = true;
-                    console.log('✅ MCP Server is ready');
-                }
-
-                try {
-                    const response = JSON.parse(line);
-                    console.log('📥 MCP JSON Response:', response);
-
-                    if (response.id && pendingResponses.has(response.id)) {
-                        const { resolve, reject } = pendingResponses.get(response.id);
-                        pendingResponses.delete(response.id);
-
-                        if (response.error) {
-                            reject(new Error(response.error.message || JSON.stringify(response.error)));
-                        } else {
-                            resolve(response.result);
-                        }
-                    }
-                } catch (e) {
-                    if (!line.includes('WARNING') && !line.includes('oauth2client')) {
-                        console.log('📄 MCP Status:', line);
-                    }
-                }
-            }
-        }
-    });
-    mcpProcess.stderr.on('data', (data) => {
-        // This will print any and all messages from Python's stderr stream
-        console.error(`[PYTHON STDERR]: ${data.toString()}`);
-    });
-    // --- END OF ADDED BLOCK ---
-
-    // It's also good practice to know if the process closes unexpectedly
-    mcpProcess.on('close', (code) => {
-        console.log(`MCP process exited with code ${code}`);
-        mcpProcess = null; // Clear the process variable
-        mcpReady = false;
-    });
-
-    setTimeout(() => {
-        initializeMCPHandshake();
-    }, 2000);
-}
-function restartMCP() {
-    console.log('♻️ Restarting MCP due to updated credentials...');
-    if (mcpProcess) {
-        mcpProcess.kill();
-    }
-    setTimeout(() => {
-        initializeMCP(user.Id);
-    }, 1000);
-}
-
-async function initializeMCPHandshake() {
-    try {
-        console.log('🤝 Starting MCP handshake...');
-
-        const initResponse = await sendMCPRequest('initialize', {
-            protocolVersion: '2024-11-05',
-            capabilities: {
-                roots: {
-                    listChanged: true
-                },
-                sampling: {}
-            },
-            clientInfo: {
-                name: 'google-workspace-client',
-                version: '1.0.0'
-            }
-        });
-
-        console.log('✅ MCP Initialize response:', initResponse);
-        await sendMCPNotification('notifications/initialized');
-        console.log('✅ MCP Handshake completed');
-        await getAvailableTools();
-
-    } catch (error) {
-        console.error('❌ MCP Handshake failed:', error);
-    }
-}
 
 async function getAvailableTools() {
     try {
@@ -782,11 +785,6 @@ async function callMCPTool(toolName, params) {
     try {
         console.log(`🔧 Calling MCP tool: ${toolName}`, params);
 
-        if (!mcpReady) {
-            // Provide demo responses when MCP is not ready
-            return getDemoToolResponse(toolName, params);
-        }
-
         const result = await sendMCPRequest('tools/call', {
             name: toolName,
             arguments: params
@@ -794,79 +792,22 @@ async function callMCPTool(toolName, params) {
 
         console.log(`✅ Tool ${toolName} result:`, result);
 
-        if (result && result.content !== undefined && result.content !== null) {
+        if (result && result.content) {
             if (Array.isArray(result.content)) {
-                return result.content.map(item => item?.text || item).join('\n');
+                return result.content.map(item => item.text || item).join('\n');
             } else if (typeof result.content === 'object' && result.content.text) {
                 return result.content.text;
             } else {
-                return result.content.toString?.() || JSON.stringify(result.content);
+                return result.content.toString();
             }
+        } else if (typeof result === 'string') {
+            return result;
+        } else {
+            return JSON.stringify(result);
         }
     } catch (error) {
         console.error(`❌ Error calling tool ${toolName}:`, error);
-        // Fallback to demo response on error
-        return getDemoToolResponse(toolName, params);
-    }
-}
-
-function getDemoToolResponse(toolName, params = {}) {
-    try {
-        const demoResponses = {
-            // Google Drive
-            'drive_search': `Demo: Found 3 files matching "${params.query}": Document1.docx, Spreadsheet1.xlsx, Presentation1.pptx`,
-            'drive_list_files': 'Demo: Listed 10 files from Google Drive: file1.pdf, file2.docx, file3.xlsx...',
-            'drive_read_file': `Demo: Reading file content for ${params.file_id}. Content: "This is sample file content..."`,
-            'drive_create_file': `Demo: Created file "${params.name}" successfully. File ID: demo_file_123`,
-            'drive_update_file': `Demo: Updated file ${params.file_id} with new content`,
-            'drive_delete_file': `Demo: Deleted file ${params.file_id} successfully`,
-            'drive_share_file': `Demo: Shared file ${params.file_id} with ${params.email} as ${params.role}`,
-            'drive_upload_file': `Demo: Uploaded file from ${params.file_path} to Google Drive`,
-            'drive_create_folder': `Demo: Created folder "${params.name}" successfully`,
-            'drive_get_file_metadata': `Demo: File metadata for ${params.file_id}: Name: Sample.pdf, Size: 1.2MB, Modified: Today`,
-
-            // Gmail
-            'gmail_send_message': `Demo: Email sent to ${params.to} with subject "${params.subject}"`,
-            'gmail_search_messages': `Demo: Found 5 messages matching "${params.query}"`,
-            'gmail_read_message': `Demo: Message content: "This is a sample email message..."`,
-            'gmail_list_messages': 'Demo: Listed 10 recent messages from Gmail inbox',
-            'gmail_send_file_attachment': `Demo: Email with attachment sent to ${params.to}`,
-            'gmail_list_labels': 'Demo: Labels: Inbox, Sent, Drafts, Important, Work, Personal',
-            'gmail_mark_as_read': `Demo: Marked ${params.message_ids.length} messages as read`,
-            'gmail_add_label': `Demo: Added labels to ${params.message_ids.length} messages`,
-
-            // Calendar
-            'calendar_create_event': `Demo: Created event "${params.summary}" for ${params.start_time}`,
-            'calendar_list_events': 'Demo: Upcoming events: Meeting at 2PM, Call at 4PM, Dinner at 7PM',
-            'calendar_update_event': `Demo: Updated event ${params.event_id}`,
-            'calendar_delete_event': `Demo: Deleted event ${params.event_id}`,
-            'calendar_get_free_busy': `Demo: Free/busy status for ${params.emails.join(', ')}: Available 9-11AM, Busy 2-4PM`,
-            'calendar_find_meeting_time': `Demo: Available meeting slots: 10AM-11AM, 3PM-4PM tomorrow`,
-
-            // Google Docs
-            'docs_create_document': `Demo: Created document "${params.title}" successfully`,
-            'docs_read_document': `Demo: Document content: "This is sample document content..."`,
-            'docs_update_document': `Demo: Updated document ${params.document_id} with new content`,
-            'docs_export_document': `Demo: Exported document ${params.document_id} as ${params.format}`,
-
-            // Google Sheets
-            'sheets_create_spreadsheet': `Demo: Created spreadsheet "${params.title}" successfully`,
-            'sheets_read_range': `Demo: Data from ${params.range}: [["Name", "Age"], ["John", "25"], ["Jane", "30"]]`,
-            'sheets_write_range': `Demo: Wrote data to ${params.range} successfully`,
-            'sheets_append_data': `Demo: Appended ${params.values.length} rows to spreadsheet`,
-
-            // File Analysis
-            'analyze_file': `Demo: Analyzed file ${params.file_path}. Type: ${params.analysis_type || 'content'}. Results: File contains text, images, and metadata.`,
-            'extract_text_from_pdf': `Demo: Extracted text from PDF: "This is sample PDF content extracted from ${params.file_path}..."`,
-            'extract_text_from_docx': `Demo: Extracted text from Word document: "Sample document content..."`,
-            'analyze_image': `Demo: Image analysis of ${params.file_path}: Resolution: 1920x1080, Format: PNG, Contains: text, objects`,
-            'extract_data_from_csv': `Demo: CSV data extracted: 100 rows, 5 columns (Name, Age, City, Email, Phone)`,
-            'convert_file_format': `Demo: Converted ${params.input_file_path} to ${params.output_format} format`
-        };
-
-        return demoResponses[toolName] || `Demo: Executed ${toolName} with parameters: ${JSON.stringify(params)}`;
-    }catch (err) {
-        return `Demo: Executed ${toolName} (error formatting response)`;
+        throw error;
     }
 }
 
