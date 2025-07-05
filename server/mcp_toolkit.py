@@ -986,6 +986,11 @@ def gmail_list_messages(max_results: int = 10, query: Optional[str] = None) -> s
 def gmail_read_message_without_attachments(message_id: str, include_attachments_info: bool = True) -> str:
     """Read email content in clean, AI-friendly format with optional attachment info"""
     try:
+        try:
+            profile = gmail_service.users().getProfile(userId='me').execute()
+            print(f"Gmail API authenticated for: {profile.get('emailAddress')}")
+        except Exception as auth_error:
+             return f"Gmail API authentication failed: {str(auth_error)}"
         message = gmail_service.users().messages().get(
             userId='me', id=message_id, format='full'
         ).execute()
