@@ -1391,10 +1391,15 @@ def get_export_mime_type(google_mime_type):
     }
     return export_mapping.get(google_mime_type, 'application/octet-stream')
 @mcp.tool()
-def gmail_read_attachment_content(message_id: str, attachment_id: Optional[str] = None) -> str:
+def gmail_read_attachment_content(message_id: str, attachment_type: Optional[str] = None) -> str:
     """
     Reads and extracts text content from a PDF, DOCX, or TXT attachment in a Gmail message.
     Enhanced with better error handling and authentication checks.
+    
+    Args:
+        message_id: The Gmail message ID containing the attachment
+        attachment_type: Optional. Specify 'pdf', 'docx', or 'txt' to select specific attachment type.
+                        If not provided, will auto-select the first supported attachment found.
     """
     if not gmail_service:
         return "Gmail service is not initialized. Please check authentication."
@@ -1427,27 +1432,44 @@ def gmail_read_attachment_content(message_id: str, attachment_id: Optional[str] 
         
         parts = message.get("payload", {}).get("parts", [])
         matched_part = None
+        attachment_id = None
 
-        if not attachment_id:
-            # Auto-select the first supported attachment
-            for part in parts:
-                filename = part.get("filename", "").lower()
-                if filename.endswith((".pdf", ".docx", ".txt")) and part.get("body", {}).get("attachmentId"):
+        # Normalize attachment_type if provided
+        if attachment_type:
+            attachment_type = attachment_type.lower().strip()
+            if not attachment_type.startswith('.'):
+                attachment_type = '.' + attachment_type
+
+        # Find the appropriate attachment
+        supported_extensions = [".pdf", ".docx", ".txt"]
+        available_attachments = []
+        
+        for part in parts:
+            filename = part.get("filename", "").lower()
+            part_attachment_id = part.get("body", {}).get("attachmentId")
+            
+            if part_attachment_id and any(filename.endswith(ext) for ext in supported_extensions):
+                available_attachments.append((filename, part, part_attachment_id))
+                
+                # If specific attachment type is requested
+                if attachment_type and filename.endswith(attachment_type):
                     matched_part = part
-                    attachment_id = part["body"]["attachmentId"]
+                    attachment_id = part_attachment_id
                     break
-            if not matched_part:
+                # If no specific type requested, use first supported attachment
+                elif not attachment_type and not matched_part:
+                    matched_part = part
+                    attachment_id = part_attachment_id
+
+        if not matched_part:
+            if attachment_type:
+                available_types = [att[0].split('.')[-1] for att in available_attachments]
+                return f"No {attachment_type.replace('.', '')} attachment found in this message. Available attachment types: {', '.join(set(available_types)) if available_types else 'None'}"
+            else:
                 return "No supported attachment (.pdf, .docx, .txt) found in this message."
-        else:
-            # Use the given attachment_id to find the part
-            for part in parts:
-                if part.get("body", {}).get("attachmentId") == attachment_id:
-                    matched_part = part
-                    break
-            if not matched_part:
-                return f"No attachment with ID {attachment_id} found in message {message_id}."
 
         filename = matched_part.get("filename", "attachment").lower()
+        print(f"Processing attachment: {filename} (ID: {attachment_id})", file=sys.stderr)
 
         # Download and decode the attachment with explicit error handling
         try:
@@ -1466,7 +1488,7 @@ def gmail_read_attachment_content(message_id: str, attachment_id: Optional[str] 
         except Exception as decode_error:
             return f"Error decoding attachment data: {decode_error}"
 
-        # Extract text (rest of the function remains the same)
+        # Extract text based on file type
         extracted_text = ""
         if filename.endswith(".pdf"):
             try:
@@ -1494,7 +1516,7 @@ def gmail_read_attachment_content(message_id: str, attachment_id: Optional[str] 
             return f"Unsupported file type: {filename}"
 
         if not extracted_text.strip():
-            return "Attachment was processed but no extractable text was found."
+            return f"Attachment '{filename}' was processed but no extractable text was found."
 
         # Check token count of extracted text
         token_count = len(encoding.encode(extracted_text))
@@ -1506,6 +1528,7 @@ def gmail_read_attachment_content(message_id: str, attachment_id: Optional[str] 
     except Exception as e:
         print(f"Unexpected error in gmail_read_attachment_content: {e}", file=sys.stderr)
         return f"Error extracting attachment text: {str(e)}"
+    
     
 @mcp.tool()
 def gmail_search_and_summarize(
