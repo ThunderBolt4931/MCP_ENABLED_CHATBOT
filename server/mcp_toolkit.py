@@ -104,10 +104,6 @@ def load_credentials():
                     creds.refresh(Request())
                     print("Token refreshed successfully", file=sys.stderr)
                     
-                    # TODO: Save new tokens back to database
-                    # You need to implement this function to update your database
-                    save_refreshed_tokens(user_id, creds)
-                    
                 except Exception as e:
                     print(f"Token refresh failed: {e}", file=sys.stderr)
                     return None
