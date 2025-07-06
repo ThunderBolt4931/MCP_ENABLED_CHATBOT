@@ -766,23 +766,24 @@ const getAllMCPTools = () => [
         type: "function",
         function: {
             name: "gmail_read_attachment_content",
-            description: "Reads and extracts text content from a PDF, DOCX, or TXT attachment in a Gmail message. Maximum token limit: 30000 tokens",
+            description: "Reads and extracts text content from a PDF, DOCX, or TXT attachment in a Gmail message. Enhanced with better error handling and authentication checks.",
             parameters: {
                 type: "object",
                 properties: {
-                    message_id: {
-                        type: "string",
-                        description: "Gmail message ID containing the attachment"
+                    message_id: { 
+                        type: "string", 
+                        description: "The Gmail message ID containing the attachment" 
                     },
-                    attachment_id: {
-                        type: "string",
-                        description: "Specific attachment ID to read. If not provided, automatically uses the first supported attachment found (optional)"
+                    attachment_type: { 
+                        type: "string", 
+                        description: "Optional. Specify 'pdf', 'docx', or 'txt' to select specific attachment type. If not provided, will auto-select the first supported attachment found.",
+                        enum: ["pdf", "docx", "txt"]
                     }
                 },
                 required: ["message_id"]
             }
         }
-    },
+    }
     {
         type: "function",
         function: {
